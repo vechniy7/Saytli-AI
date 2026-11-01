@@ -8,6 +8,7 @@ import secrets
 import hashlib
 import threading
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -31,7 +32,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from dotenv import load_dotenv
 from skills import build_skill_prompt
-from quality import ensure_initial_render, quality_report, needs_fallback
+from quality import ensure_initial_render, quality_report, needs_fallback, publication_safety_report
 from pipeline import static_review
 from design_systems import select_design_system
 from browser_qa import browser_smoke
@@ -50,23 +51,102 @@ DB_FILE = DATA_DIR / "sites.json"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 SITES_DIR.mkdir(parents=True, exist_ok=True)
 _db_lock = threading.Lock()
+DB_LOCK_FILE = DATA_DIR / "sites.json.lock"
+
+
+@contextmanager
+def _database_lock():
+    """Lock the shared JSON database across the bot and web processes."""
+    DB_LOCK_FILE.touch(exist_ok=True)
+    with _db_lock:
+        handle = DB_LOCK_FILE.open("r+b")
+        try:
+            if os.name == "nt":
+                import msvcrt
+                handle.seek(0)
+                handle.write(b"0")
+                handle.flush()
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
 
 
 def load_db() -> dict:
-    with _db_lock:
+    with _database_lock():
         if not DB_FILE.exists():
             return {"sites": {}}
         try:
-            return json.loads(DB_FILE.read_text(encoding="utf-8"))
+            data = json.loads(DB_FILE.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) and isinstance(data.get("sites", {}), dict) else {"sites": {}}
         except (json.JSONDecodeError, OSError):
             return {"sites": {}}
 
 
 def save_db(db: dict) -> None:
-    with _db_lock:
-        tmp = DB_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(db, ensure_ascii=False, indent=2), encoding="utf-8")
+    DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with _database_lock():
+        tmp = DB_FILE.with_name(f".{DB_FILE.name}.{os.getpid()}.tmp")
+        payload = json.dumps(db, ensure_ascii=False, indent=2)
+        with tmp.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
         tmp.replace(DB_FILE)
+
+
+def update_db(mutator):
+    """Read, mutate and atomically save the database under one process lock."""
+    with _database_lock():
+        if DB_FILE.exists():
+            try:
+                db = json.loads(DB_FILE.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                db = {"sites": {}}
+        else:
+            db = {"sites": {}}
+        if not isinstance(db, dict) or not isinstance(db.get("sites", {}), dict):
+            db = {"sites": {}}
+        result = mutator(db)
+        tmp = DB_FILE.with_name(f".{DB_FILE.name}.{os.getpid()}.tmp")
+        with tmp.open("w", encoding="utf-8", newline="\n") as handle:
+            json.dump(db, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp.replace(DB_FILE)
+        return result
+
+
+def safe_site_path(raw_path: str | None, site_id: str) -> Path | None:
+    """Resolve an active artifact and keep it inside the publication root."""
+    root = SITES_DIR.resolve()
+    candidates = []
+    if raw_path:
+        candidates.append(Path(raw_path))
+    candidates.append(SITES_DIR / site_id)
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+            if not resolved.is_relative_to(root):
+                continue
+            target = resolved if resolved.is_file() else resolved / "index.html"
+            if target.is_relative_to(root) and target.is_file():
+                return target
+        except (OSError, RuntimeError, ValueError):
+            continue
+    return None
 
 
 def slugify(value: str) -> str:
@@ -132,16 +212,12 @@ def main_keyboard() -> InlineKeyboardMarkup:
 def presets_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="☕ Кофейня / Ресторан", callback_data="preset:cafe"),
-            InlineKeyboardButton(text="💻 IT-портфолио", callback_data="preset:portfolio"),
+            InlineKeyboardButton(text="👤 Личное портфолио", callback_data="preset:portfolio"),
+            InlineKeyboardButton(text="🛠 Услуги специалиста", callback_data="preset:services"),
         ],
         [
-            InlineKeyboardButton(text="⚡ SaaS / Сервис", callback_data="preset:saas"),
-            InlineKeyboardButton(text="🛒 Интернет-магазин", callback_data="preset:shop"),
-        ],
-        [
-            InlineKeyboardButton(text="🏢 Услуги бизнеса", callback_data="preset:services"),
-            InlineKeyboardButton(text="📱 Мобильное приложение", callback_data="preset:app"),
+            InlineKeyboardButton(text="🚀 Собственный проект", callback_data="preset:project"),
+            InlineKeyboardButton(text="✍️ Свой бриф", callback_data="preset:custom"),
         ],
         [
             InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action"),
@@ -150,12 +226,9 @@ def presets_keyboard() -> InlineKeyboardMarkup:
 
 
 PRESET_BRIEFS = {
-    "cafe": "Стильный и уютный одностраничный сайт для современной городской кофейни: витрина десертов и напитков с ценами, блок бронирования столика, атмосферная галерея, расписание и интерактивная карта с адресом.",
-    "portfolio": "Премиальное портфолио senior frontend / AI инженера: список ключевых проектов с тегами технологий, кейсы с результатами, интерактивные карточки навыков, отзывы клиентов и форма обратной связи.",
-    "saas": "Конвертящий landing page для SaaS-платформы на базе AI: цепляющий hero-блок, интерактивный калькулятор выгоды, сетка возможностей, блок с ценами (тарифы), блок частых вопросов (FAQ) и призыв к действию.",
-    "shop": "Минималистичный лендинг бренда стильной одежды и аксессуаров: каталог хитов с карточками товаров, баннер акции с таймером, отзывы покупателей, условия быстрой доставки и кнопка заказа.",
-    "services": "Сайт юридической и консалтинговой компании: перечень услуг с калькулятором стоимости, экспертная команда, блок кейсов и успешных решений, сертификаты и запись на первичную консультацию.",
-    "app": "Яркий промо-сайт нового мобильного приложения: 3D-мокапы интерфейса, ключевые фичи в виде интерактивных слайдов, видео-превью, счетчик активных пользователей и кнопки App Store / Google Play."
+    "portfolio": "Современное личное портфолио специалиста. Покажи кто я, чем занимаюсь, мои ключевые навыки, избранные проекты, процесс работы и способы связи. Используй только факты, которые я укажу, без выдуманных отзывов и цифр.",
+    "services": "Понятная страница услуг специалиста. Покажи кому я помогаю, какие задачи решаю, список услуг, этапы работы, примеры работ и простой способ связаться со мной. Не добавляй цены или гарантии, если я их не указал.",
+    "project": "Сайт собственного цифрового проекта или сервиса. Объясни проблему, решение, ключевые возможности, сценарий использования, ограничения и способ связи или знакомства с проектом. Не выдумывай пользователей, метрики и интеграции.",
 }
 
 
@@ -173,10 +246,10 @@ async def start(message: Message, state: FSMContext):
     await state.clear()
     welcome_text = (
         "🚀 <b>Добро пожаловать в Saytli AI!</b>\n\n"
-        "Я создаю, верстаю и мгновенно публикую современные сайты с помощью нейросетей.\n\n"
-        "• <b>✨ Создать сайт</b> — генерация по брифу или готовому шаблону\n"
+        "Я создаю и сразу публикую современные сайты-портфолио с помощью нейросетей.\n\n"
+        "• <b>✨ Создать сайт</b> — портфолио, услуги или собственный проект\n"
         "• <b>📁 Мои сайты</b> — просмотр, редактирование и откат версий\n"
-        "• <b>💬 AI-консультант</b> — генерация идей, текстов и структуры\n"
+        "• <b>💬 AI-консультант</b> — помощь со структурой и текстами\n"
         "• <b>📱 Mini App</b> — открывайте сайты прямо внутри Telegram!"
     )
     await message.answer(welcome_text, reply_markup=main_keyboard(), parse_mode="HTML")
@@ -205,8 +278,8 @@ async def create_start(event: Message | CallbackQuery, state: FSMContext):
     await state.set_state(CreateSite.brief)
     prompt_text = (
         "✨ <b>Создание нового сайта</b>\n\n"
-        "Выберите готовый шаблон ниже для быстрого старта или <b>напишите свой бриф сообщением</b>:\n\n"
-        "<i>Пример: «Сайт для студии йоги с расписанием занятий, ценами на абонементы и формой записи»</i>\n\n"
+        "Выберите направление или <b>напишите свой бриф сообщением</b>. Saytli создаёт личные портфолио, страницы услуг и сайты собственных проектов.\n\n"
+        "<i>Пример: «Я дизайнер интерфейсов. Покажи мои услуги, 3 проекта, процесс работы и контакты»</i>\n\n"
         "/cancel — отмена в любой момент"
     )
     if isinstance(event, CallbackQuery):
@@ -219,6 +292,14 @@ async def create_start(event: Message | CallbackQuery, state: FSMContext):
 async def preset_chosen(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     preset_key = callback.data.split(":", 1)[1]
+    if preset_key == "custom":
+        await state.set_state(CreateSite.brief)
+        await callback.message.edit_text(
+            "✍️ <b>Опишите будущий сайт</b>\n\n"
+            "Расскажите, кто вы, чем занимаетесь, какие проекты или услуги показать и как с вами связаться. Можно писать свободно — AI соберёт из этого структуру сайта.",
+            parse_mode="HTML",
+        )
+        return
     brief = PRESET_BRIEFS.get(preset_key)
     if not brief:
         await callback.message.answer("Шаблон не найден. Опишите сайт своими словами.")
@@ -296,7 +377,8 @@ async def help_command(event: Message | CallbackQuery):
         "✓ <b>Telegram Mini Apps</b> — мгновенный просмотр сайта прямо в боте.\n"
         "✓ <b>Умные правки через ИИ</b> — доработка конкретных блоков естественным языком.\n"
         "✓ <b>Мгновенный откат</b> — верните предыдущую версию, если правка не подошла.\n"
-        "✓ <b>Дизайн-системы</b> — профессиональная верстка на Tailwind CSS без шаблонного вида."
+        "✓ <b>Три понятных направления</b> — портфолио, услуги и собственный проект.\n"
+        "✓ <b>Дизайн-системы</b> — профессиональная адаптивная верстка без шаблонного вида."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✨ Создать сайт", callback_data="create")],
@@ -469,7 +551,7 @@ async def generate_site(message: Message, status: Message, brief: str):
                 last_error = exc
                 if attempt == 0:
                     request_payload["messages"][1]["content"] = (
-                        prompt + "\n\nСделай реализацию как цельный демонстрационный single-page HTML с имитацией основных экранов через JS; не описывай backend-код."
+                        prompt + "\n\nСделай реализацию как цельный single-page HTML-портфолио с рабочей навигацией и frontend-интерактивностью; не описывай backend-код."
                     )
         if content is None:
             raise last_error or RuntimeError("LLM did not return content")
@@ -478,6 +560,7 @@ async def generate_site(message: Message, status: Message, brief: str):
         if not re.search(r"<html[\s>]|<!doctype html", content, re.I):
             raise RuntimeError("Generated content is not HTML")
         content = ensure_initial_render(content)
+        safety_report = publication_safety_report(content)
         await progress(status, stages, 3)
 
         report = quality_report(content)
@@ -488,7 +571,7 @@ async def generate_site(message: Message, status: Message, brief: str):
             report["score"], frontend_report["score"], browser_report["passed"]
         )
         browser_hard = all(browser_report["checks"].get(k, False) for k in ("quality", "not_blank", "has_navigation", "has_interaction", "has_mobile_css"))
-        if report["score"] < 0.75 or frontend_report["score"] < 0.75 or not browser_hard or needs_fallback(content):
+        if report["score"] < 0.75 or frontend_report["score"] < 0.75 or not browser_hard or needs_fallback(content) or not safety_report["passed"]:
             raise RuntimeError("Generated site quality score too low or empty")
 
         await progress(status, stages, 4)
@@ -496,8 +579,7 @@ async def generate_site(message: Message, status: Message, brief: str):
         folder.mkdir(parents=True, exist_ok=False)
         (folder / "index.html").write_text(content, encoding="utf-8")
 
-        db = load_db()
-        db["sites"][site_id] = {
+        site_record = {
             "owner": message.from_user.id,
             "brief": brief,
             "skills": skill_names,
@@ -508,7 +590,7 @@ async def generate_site(message: Message, status: Message, brief: str):
             "created": __import__("datetime").datetime.utcnow().isoformat(),
             "path": str(folder),
         }
-        save_db(db)
+        update_db(lambda db: db["sites"].__setitem__(site_id, site_record))
 
         url = f"{PUBLIC_BASE}/s/{site_id}"
         result_text = (
@@ -649,10 +731,10 @@ async def ai_edit_start(callback: CallbackQuery, state: FSMContext):
     text = (
         "✨ <b>Опишите правки для ИИ-редактора:</b>\n\n"
         "Например:\n"
-        "• <i>«Сделай первый экран светлее и добавь видеофон»</i>\n"
-        "• <i>«Добавь блок тарифов с 3 планами подписки»</i>\n"
-        "• <i>«Добавь секцию с отзывами клиентов и рейтинг»</i>\n"
-        "• <i>«Замени контакты и добавь форму обратного звонка»</i>\n\n"
+        "• <i>«Сделай первый экран светлее и спокойнее»</i>\n"
+        "• <i>«Добавь ещё один кейс в раздел проектов»</i>\n"
+        "• <i>«Сделай блок услуг более понятным и компактным»</i>\n"
+        "• <i>«Замени контакты и добавь ссылку на Telegram»</i>\n\n"
         "/cancel — отменить редактирование"
     )
     await callback.message.edit_text(text, parse_mode="HTML")
@@ -691,25 +773,16 @@ async def edit_site(message: Message, status: Message, site_id: str, delta: str)
         site = db["sites"].get(site_id)
         if not site or site.get("owner") != message.from_user.id:
             raise RuntimeError("ownership")
-        path = Path(site["path"]) / "index.html"
+        path = safe_site_path(site.get("path"), site_id)
+        if not path:
+            raise RuntimeError("site artifact not found")
         current = path.read_text(encoding="utf-8")
-        production_request = bool(re.search(
-            r"production|продакшен|продакшн|реальн\w*\s+(?:аккаунт|авторизац|бэкенд|backend|база|заказ)|без\s+demo|убери\s+demo|убрать\s+demo",
-            delta,
-            re.I
-        ))
-        production_note = (
-            "ВАЖНО: пользователь просит production backend. Этот проект публикует только статический HTML "
-            "и не может создать реальный серверный backend из одного файла. Сохрани рабочий frontend-интерфейс, "
-            "убери баннеры демо-режима и верни чистую интерактивную страницу."
-            if production_request else
-            "Не меняй demo/production статус без явной просьбы."
-        )
         prompt = (
-            f"Ты senior frontend developer и технический лид. Обнови существующий HTML по задаче пользователя. "
+            f"Ты senior frontend developer и технический лид Saytli AI. Обнови существующий HTML-портфолио по задаче пользователя. "
             f"Сохрани все рабочие функции, контент и ссылки, добавь изменение цельно, не удаляй рабочие разделы. "
-            f"Удали любые баннеры и подписи 'Demo mode', 'ДЕМО-РЕЖИМ' из видимого интерфейса. Верни только полный HTML.\n\n"
-            f"{production_note}\n\nТекущий HTML:\n{current}\n\nЗадача изменения:\n{delta}"
+            f"Не добавляй магазины, корзины, оплату, авторизацию, каталог товаров или выдуманные факты. "
+            f"Удали любые служебные баннеры и подписи о режиме работы из видимого интерфейса. Верни только полный HTML.\n\n"
+            f"Текущий HTML:\n{current}\n\nЗадача изменения:\n{delta}"
         )
         async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=20.0)) as client:
             response = await client.post(
@@ -730,11 +803,14 @@ async def edit_site(message: Message, status: Message, site_id: str, delta: str)
 
         content = re.sub(r"^```(?:html)?\s*|\s*```$", "", content.strip(), flags=re.I)
         content = ensure_initial_render(content)
+        safety_report = publication_safety_report(content)
         report = quality_report(content)
-        if report["score"] < .75 or needs_fallback(content):
+        frontend_report = static_review(content)
+        browser_report = browser_smoke(content)
+        if report["score"] < .75 or frontend_report["score"] < .75 or not browser_report["passed"] or needs_fallback(content) or not safety_report["passed"]:
             raise RuntimeError("quality")
 
-        version = int(site.get("version", 1)) + 1
+        version = max((int(item.get("version", 0)) for item in site.get("versions", [])), default=int(site.get("version", 1))) + 1
         version_dir = SITES_DIR / f"{site_id}--v{version}"
         version_dir.mkdir(parents=True, exist_ok=False)
         (version_dir / "index.html").write_text(content, encoding="utf-8")
@@ -745,7 +821,14 @@ async def edit_site(message: Message, status: Message, site_id: str, delta: str)
         site["version"] = version
         site["last_edit"] = delta[:200]
         site["skills"] = site.get("skills", [])
-        save_db(db)
+        def save_edit(current_db):
+            latest = current_db["sites"].get(site_id)
+            if not latest or latest.get("owner") != message.from_user.id:
+                raise RuntimeError("ownership changed")
+            if int(latest.get("version", 1)) >= version:
+                raise RuntimeError("site changed during edit")
+            current_db["sites"][site_id] = site
+        update_db(save_edit)
 
         url = f"{PUBLIC_BASE}/s/{site_id}"
         await status.edit_text(
@@ -789,24 +872,30 @@ async def rollback_site(callback: CallbackQuery):
         await callback.answer("У этого сайта пока только одна версия. Откат не требуется.", show_alert=True)
         return
 
-    current_ver = versions.pop()
-    prev_ver = versions[-1]
+    current_version = int(site.get("version", 1))
+    current_index = next((index for index, item in enumerate(versions) if int(item.get("version", 0)) == current_version), len(versions) - 1)
+    if current_index <= 0:
+        await callback.answer("Сайт уже находится на самой ранней версии.", show_alert=True)
+        return
+    current_ver = versions[current_index]
+    prev_ver = versions[current_index - 1]
 
     # Switch active path to previous version
     site["path"] = prev_ver["path"]
     site["version"] = prev_ver["version"]
     site["last_edit"] = f"Откат с v{current_ver.get('version')} к v{prev_ver.get('version')}"
-    save_db(db)
-
-    # Clean up newer directory if it exists
+    def save_rollback(current_db):
+        latest = current_db["sites"].get(site_id)
+        if not latest or latest.get("owner") != callback.from_user.id:
+            raise RuntimeError("ownership changed")
+        if int(latest.get("version", 1)) != current_version:
+            raise RuntimeError("site changed during rollback")
+        current_db["sites"][site_id] = site
     try:
-        cur_dir = Path(current_ver.get("path", ""))
-        if cur_dir.is_relative_to(SITES_DIR) and cur_dir.exists():
-            for f in cur_dir.iterdir():
-                f.unlink(missing_ok=True)
-            cur_dir.rmdir()
-    except Exception as exc:
-        logger.warning("could not clean up rolled back dir: %s", exc)
+        update_db(save_rollback)
+    except RuntimeError:
+        await callback.message.answer("Сайт изменился параллельно. Откройте его карточку и повторите действие.")
+        return
 
     url = f"{PUBLIC_BASE}/s/{site_id}"
     await callback.message.edit_text(
@@ -854,18 +943,30 @@ async def delete_site_confirmed(callback: CallbackQuery):
         await callback.message.answer("Сайт не найден.")
         return
 
-    # Delete all associated folders and versions
-    for item in SITES_DIR.glob(f"{site_id}*"):
-        if item.is_dir() and item.is_relative_to(SITES_DIR):
-            try:
-                for child in item.iterdir():
-                    child.unlink(missing_ok=True)
-                item.rmdir()
-            except Exception as exc:
-                logger.warning("error removing site folder %s: %s", item, exc)
+    # Delete only recorded version directories, never arbitrary matching paths.
+    recorded_paths = {item.get("path") for item in site.get("versions", []) if item.get("path")}
+    recorded_paths.add(site.get("path"))
+    for raw_path in recorded_paths:
+        try:
+            folder = Path(raw_path).resolve()
+            if folder.is_dir() and folder.is_relative_to(SITES_DIR.resolve()):
+                for child in folder.iterdir():
+                    if child.is_file() or child.is_symlink():
+                        child.unlink(missing_ok=True)
+                folder.rmdir()
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.warning("error removing site folder: %s", type(exc).__name__)
 
-    del db["sites"][site_id]
-    save_db(db)
+    def remove_site(current_db):
+        latest = current_db["sites"].get(site_id)
+        if not latest or latest.get("owner") != callback.from_user.id:
+            raise RuntimeError("ownership changed")
+        current_db["sites"].pop(site_id, None)
+    try:
+        update_db(remove_site)
+    except RuntimeError:
+        await callback.message.answer("Сайт уже изменился или был удалён. Обновите список сайтов.")
+        return
     await callback.message.edit_text("🗑 <b>Сайт и все его версии успешно удалены.</b>", parse_mode="HTML", reply_markup=main_keyboard())
 
 
@@ -885,14 +986,9 @@ def preview_site(site_id: str):
     site = db.get("sites", {}).get(site_id)
     if not site:
         raise HTTPException(status_code=404)
-    path = Path(site.get("path", "")).resolve()
-    target_file = path if path.is_file() else (path / "index.html")
-    if not target_file.is_relative_to(SITES_DIR.resolve()) or not target_file.exists():
-        fallback_file = (SITES_DIR / site_id / "index.html").resolve()
-        if fallback_file.is_relative_to(SITES_DIR.resolve()) and fallback_file.exists():
-            target_file = fallback_file
-        else:
-            raise HTTPException(status_code=404)
+    target_file = safe_site_path(site.get("path"), site_id)
+    if not target_file:
+        raise HTTPException(status_code=404)
     return FileResponse(
         target_file,
         media_type="text/html",
@@ -913,14 +1009,9 @@ def public_site(site_id: str):
     if not site:
         raise HTTPException(status_code=404)
     # Resolve from active site path, supporting versioned directories
-    path = Path(site.get("path", "")).resolve()
-    target_file = path if path.is_file() else (path / "index.html")
-    if not target_file.is_relative_to(SITES_DIR.resolve()) or not target_file.exists():
-        fallback_file = (SITES_DIR / site_id / "index.html").resolve()
-        if fallback_file.is_relative_to(SITES_DIR.resolve()) and fallback_file.exists():
-            target_file = fallback_file
-        else:
-            raise HTTPException(status_code=404)
+    target_file = safe_site_path(site.get("path"), site_id)
+    if not target_file:
+        raise HTTPException(status_code=404)
     return FileResponse(
         target_file,
         media_type="text/html",

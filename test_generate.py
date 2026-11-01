@@ -2,7 +2,7 @@ import os, re, httpx, sys
 from pathlib import Path
 from skills import build_skill_prompt
 from quality import ensure_initial_render, quality_report
-brief = sys.argv[1] if len(sys.argv)>1 else 'Создай современный ресторанный сайт с меню, блюдами, бронированием и корзиной в премиальном тёмном стиле.'
+brief = sys.argv[1] if len(sys.argv)>1 else 'Создай современное портфолио специалиста по ремонту телефонов: услуги, примеры работ, процесс и контакты в премиальном тёмном стиле.'
 names, prompt = build_skill_prompt(brief)
 print('SKILLS', names, flush=True)
 with httpx.Client(timeout=httpx.Timeout(600, connect=20)) as c:

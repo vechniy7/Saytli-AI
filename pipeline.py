@@ -1,6 +1,6 @@
 """Frontend generation quality pipeline: deterministic QA plus an optional AI polish pass."""
 import json, re
-from quality import ensure_initial_render, quality_report, needs_fallback
+from quality import ensure_initial_render, quality_report, needs_fallback, publication_safety_report
 
 REVIEW_SYSTEM = """Ты lead frontend reviewer. Проверь HTML как строгий senior UI/UX, accessibility и JavaScript QA инженер. Верни JSON без markdown с полями: score (0..10), issues (массив строк), fixed_html (полный HTML). Если HTML уже качественный, верни его без потери функций. Всегда сохрани контент, интерактивность и ссылки. Исправь пустые render-контейнеры, отсутствующий initial render, сломанные селекторы и очевидные JS-синтаксические ошибки. Не добавляй backend-заявления."""
 
@@ -13,6 +13,7 @@ def static_review(html: str) -> dict:
         "has_focus_states": bool(re.search(r":focus(?:-visible)?", html, re.I)),
         "no_empty_app_shell": not needs_fallback(html),
     })
+    report["checks"].update(publication_safety_report(html)["checks"])
     report["score"] = round(sum(report["checks"].values()) / len(report["checks"]), 2)
     report["passed"] = report["score"] >= 0.8
     return report

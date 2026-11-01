@@ -1,6 +1,35 @@
 """Deterministic checks and normalizers for generated static sites."""
 import re
 
+
+def publication_safety_report(html: str) -> dict:
+    """Reject markup that could escape the static-site publication boundary.
+
+    Generated HTML is untrusted model output.  The checks intentionally target
+    the small, single-file frontend contract used by Saytli instead of trying
+    to turn a regex parser into a general-purpose HTML sanitizer.
+    """
+    body_match = re.search(r"<body\b[^>]*>([\s\S]*?)</body\s*>", html, re.I)
+    visible = ""
+    if body_match:
+        visible = re.sub(r"<script[\s\S]*?</script\s*>|<style[\s\S]*?</style\s*>|<[^>]+>", " ", body_match.group(1), flags=re.I)
+        visible = re.sub(r"\s+", " ", visible).strip().casefold()
+
+    checks = {
+        "no_dangerous_embeds": not re.search(r"<(?:iframe|object|embed|applet|base)\b", html, re.I),
+        "no_refresh_redirect": not re.search(r"<meta\b[^>]*http-equiv\s*=\s*[\"']?refresh", html, re.I),
+        "no_inline_event_handlers": not re.search(r"\son[a-z][a-z0-9_-]*\s*=", html, re.I),
+        "no_script_urls": not re.search(r"(?:href|src|action|formaction|poster|xlink:href)\s*=\s*[\"']\s*(?:javascript|vbscript):", html, re.I),
+        "no_external_script_tags": not re.search(r"<script\b[^>]+\bsrc\s*=\s*[\"']\s*(?:https?:)?//", html, re.I),
+        "no_external_network_code": not re.search(r"\b(?:fetch|XMLHttpRequest|WebSocket)\s*\(|navigator\.sendBeacon\s*\(|document\.cookie\b", html, re.I),
+        "no_service_banners": not re.search(r"\b(?:demo(?:\s|-)?mode|prototype)\b|демо[\s-]*режим|локальн(?:ый|ая)\s+демо", visible, re.I),
+    }
+    return {
+        "checks": checks,
+        "passed": all(checks.values()),
+        "errors": [name for name, passed in checks.items() if not passed],
+    }
+
 def quality_report(html: str) -> dict:
     low = html.casefold()
     checks = {
