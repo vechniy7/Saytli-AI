@@ -879,16 +879,20 @@ def health():
 
 @app.get("/preview/{site_id}", response_class=HTMLResponse)
 def preview_site(site_id: str):
-    if not re.fullmatch(r"[a-z0-9а-яё_-]{1,60}", site_id, re.I):
+    if not re.fullmatch(r"[\w-]{1,128}", site_id, re.UNICODE):
         raise HTTPException(status_code=404)
     db = load_db()
     site = db.get("sites", {}).get(site_id)
     if not site:
         raise HTTPException(status_code=404)
     path = Path(site.get("path", "")).resolve()
-    target_file = path / "index.html"
-    if not path.is_relative_to(SITES_DIR.resolve()) or not target_file.exists():
-        raise HTTPException(status_code=404)
+    target_file = path if path.is_file() else (path / "index.html")
+    if not target_file.is_relative_to(SITES_DIR.resolve()) or not target_file.exists():
+        fallback_file = (SITES_DIR / site_id / "index.html").resolve()
+        if fallback_file.is_relative_to(SITES_DIR.resolve()) and fallback_file.exists():
+            target_file = fallback_file
+        else:
+            raise HTTPException(status_code=404)
     return FileResponse(
         target_file,
         media_type="text/html",
@@ -902,7 +906,7 @@ def preview_site(site_id: str):
 
 @app.get("/s/{site_id}", response_class=HTMLResponse)
 def public_site(site_id: str):
-    if not re.fullmatch(r"[a-z0-9а-яё_-]{1,60}", site_id, re.I):
+    if not re.fullmatch(r"[\w-]{1,128}", site_id, re.UNICODE):
         raise HTTPException(status_code=404)
     db = load_db()
     site = db.get("sites", {}).get(site_id)
@@ -910,9 +914,13 @@ def public_site(site_id: str):
         raise HTTPException(status_code=404)
     # Resolve from active site path, supporting versioned directories
     path = Path(site.get("path", "")).resolve()
-    target_file = path / "index.html"
-    if not path.is_relative_to(SITES_DIR.resolve()) or not target_file.exists():
-        raise HTTPException(status_code=404)
+    target_file = path if path.is_file() else (path / "index.html")
+    if not target_file.is_relative_to(SITES_DIR.resolve()) or not target_file.exists():
+        fallback_file = (SITES_DIR / site_id / "index.html").resolve()
+        if fallback_file.is_relative_to(SITES_DIR.resolve()) and fallback_file.exists():
+            target_file = fallback_file
+        else:
+            raise HTTPException(status_code=404)
     return FileResponse(
         target_file,
         media_type="text/html",
