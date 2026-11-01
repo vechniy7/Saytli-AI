@@ -767,6 +767,61 @@ async def receive_edit_brief(message: Message, state: FSMContext):
     asyncio.create_task(edit_site(message, status, site_id, delta))
 
 
+def build_contact_actions_fallback(current: str, delta: str) -> str | None:
+    """Apply safe, deterministic contact changes when the model edit is rejected.
+
+    Map embeds and third-party widgets are intentionally rejected by the
+    publication safety policy.  These common requests do not need an LLM at
+    all: a normal link plus a small local form is more reliable and keeps the
+    generated page inside the static-site contract.
+    """
+    request = delta.casefold()
+    wants_map = bool(re.search(r"карта|маршрут|яндекс\s*карт|yandex\s*map|maps", request))
+    wants_telegram = bool(re.search(r"телеграм|telegram|@tsuloew|t\.me", request))
+    if not wants_map and not wants_telegram:
+        return None
+    if not re.search(r"</body\s*>", current, re.I):
+        return None
+
+    parts = []
+    if wants_map and 'id="saytli-route-actions"' not in current:
+        parts.append(
+            """<section id="saytli-route-actions" aria-label="Маршрут" style="margin:2rem 0;padding:1.25rem;border:1px solid rgba(127,127,127,.25);border-radius:1rem">
+  <h2>Как нас найти</h2>
+  <p>Введите адрес, чтобы построить маршрут от вашего местоположения.</p>
+  <div style="display:flex;gap:.75rem;flex-wrap:wrap;align-items:center">
+    <label for="saytli-route-address" style="position:absolute;width:1px;height:1px;overflow:hidden">Адрес</label>
+    <input id="saytli-route-address" type="text" placeholder="Введите адрес" autocomplete="street-address" style="flex:1 1 16rem;min-height:2.75rem;padding:.65rem .8rem;border:1px solid currentColor;border-radius:.65rem">
+    <button id="saytli-route-button" type="button" style="min-height:2.75rem;padding:.65rem 1rem;border:0;border-radius:.65rem;cursor:pointer">Построить маршрут</button>
+  </div>
+</section>
+<script>
+(function () {
+  var input = document.getElementById("saytli-route-address");
+  var button = document.getElementById("saytli-route-button");
+  if (!input || !button) return;
+  button.addEventListener("click", function () {
+    var address = input.value.trim();
+    if (!address) { input.focus(); return; }
+    window.open("https://yandex.ru/maps/?rtext=~" + encodeURIComponent(address) + "&rtt=auto", "_blank", "noopener");
+  });
+}());
+</script>"""
+        )
+    if wants_telegram and "https://t.me/tsuloew" not in current:
+        parts.append(
+            """<a href="https://t.me/tsuloew" target="_blank" rel="noopener noreferrer" aria-label="Связаться в Telegram" style="display:inline-flex;align-items:center;gap:.5rem">Написать в Telegram</a>"""
+        )
+    if not parts:
+        return current
+
+    # Keep the fallback self-contained and do not interpolate the user's text
+    # into HTML or JavaScript.
+    addition = "\n<div id=\"saytli-contact-actions\" style=\"display:flex;gap:1rem;flex-wrap:wrap;align-items:center;margin:1.5rem 0\">\n" + "\n".join(parts) + "\n</div>\n"
+    marker = re.search(r"</body\s*>", current, re.I)
+    return current[:marker.start()] + addition + current[marker.start():]
+
+
 async def edit_site(message: Message, status: Message, site_id: str, delta: str):
     try:
         db = load_db()
@@ -782,33 +837,93 @@ async def edit_site(message: Message, status: Message, site_id: str, delta: str)
             f"Сохрани все рабочие функции, контент и ссылки, добавь изменение цельно, не удаляй рабочие разделы. "
             f"Не добавляй магазины, корзины, оплату, авторизацию, каталог товаров или выдуманные факты. "
             f"Удали любые служебные баннеры и подписи о режиме работы из видимого интерфейса. Верни только полный HTML.\n\n"
+            f"ПРАВИЛА ДЛЯ КАРТ И КОНТАКТОВ: если пользователь просит карту или маршрут, не используй iframe, object, embed, внешние script-теги, fetch, XMLHttpRequest или WebSocket. "
+            f"Сделай аккуратный блок адреса с обычной HTML-кнопкой/ссылкой на https://yandex.ru/maps/ для построения маршрута. "
+            f"Если адрес уже есть в текущем HTML — используй его; если адрес не указан, добавь поле ввода адреса и frontend-кнопку, которая открывает ссылку Яндекс.Карт с URL-кодированным адресом. "
+            f"Если пользователь просит кнопку Telegram для @tsuloew, используй ровно ссылку https://t.me/tsuloew. "
+            f"Все новые функции должны работать без backend и без сетевых запросов из JavaScript.\n\n"
             f"Текущий HTML:\n{current}\n\nЗадача изменения:\n{delta}"
         )
-        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=20.0)) as client:
-            response = await client.post(
-                f"{LLM_BASE}/chat/completions",
-                headers={"Authorization": f"Bearer {LLM_KEY}"},
-                json={
-                    "model": MODEL,
-                    "messages": [
-                        {"role": "system", "content": "Ты senior frontend developer."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    "temperature": 0.65,
-                    "max_tokens": 18000
-                }
-            )
-            response.raise_for_status()
-            content = response.json()["choices"][0]["message"]["content"]
+        request_payload = {
+            "model": MODEL,
+            "messages": [
+                {"role": "system", "content": "Ты senior frontend developer. Верни только полный самодостаточный HTML-документ без markdown-ограждений."},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.55,
+            "max_tokens": 18000
+        }
 
-        content = re.sub(r"^```(?:html)?\s*|\s*```$", "", content.strip(), flags=re.I)
-        content = ensure_initial_render(content)
-        safety_report = publication_safety_report(content)
-        report = quality_report(content)
-        frontend_report = static_review(content)
-        browser_report = browser_smoke(content)
-        if report["score"] < .75 or frontend_report["score"] < .75 or not browser_report["passed"] or needs_fallback(content) or not safety_report["passed"]:
-            raise RuntimeError("quality")
+        # A map is commonly returned as an iframe, but generated HTML is published
+        # with a deliberately strict CSP/safety policy. Give the model one focused
+        # repair attempt instead of immediately discarding an otherwise useful edit.
+        content = None
+        validation_errors = []
+        for attempt in range(2):
+            async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=20.0)) as client:
+                response = await client.post(
+                    f"{LLM_BASE}/chat/completions",
+                    headers={"Authorization": f"Bearer {LLM_KEY}"},
+                    json=request_payload
+                )
+                response.raise_for_status()
+                candidate = response.json()["choices"][0]["message"]["content"]
+
+            candidate = re.sub(r"^```(?:html)?\s*|\s*```$", "", candidate.strip(), flags=re.I)
+            candidate = ensure_initial_render(candidate)
+            safety_report = publication_safety_report(candidate)
+            report = quality_report(candidate)
+            frontend_report = static_review(candidate)
+            browser_report = browser_smoke(candidate)
+            validation_errors = list(safety_report["errors"])
+            requested_feature_errors = []
+            request_text = delta.casefold()
+            if re.search(r"карта|маршрут|яндекс\s*карт|yandex\s*map|maps", request_text) and not re.search(r"yandex\.ru/maps", candidate, re.I):
+                requested_feature_errors.append("missing_yandex_route")
+            if re.search(r"телеграм|telegram|@tsuloew|t\.me", request_text) and "https://t.me/tsuloew" not in candidate:
+                requested_feature_errors.append("missing_telegram_link")
+            validation_errors.extend(requested_feature_errors)
+            if report["score"] < .75:
+                validation_errors.append(f"quality_score={report['score']}")
+            if frontend_report["score"] < .75:
+                validation_errors.append(f"frontend_score={frontend_report['score']}")
+            if not browser_report["passed"]:
+                validation_errors.extend(f"browser:{error}" for error in browser_report["errors"])
+            if not requested_feature_errors and not needs_fallback(candidate) and safety_report["passed"] and report["score"] >= .75 and frontend_report["score"] >= .75 and browser_report["passed"]:
+                content = candidate
+                break
+
+            if attempt == 0:
+                request_payload["messages"][1]["content"] = (
+                    prompt
+                    + "\n\nПРЕДЫДУЩИЙ ВАРИАНТ ОТКЛОНЁН ПРОВЕРКОЙ. "
+                    + f"Причины: {', '.join(validation_errors)}. "
+                    + "Верни полный HTML заново. Не используй iframe/object/embed, внешние script-теги, fetch, XMLHttpRequest, WebSocket или inline on* handlers. "
+                    + "Карту реализуй только как ссылку/кнопку на Яндекс.Карты или локальную форму адреса, открывающую маршрут через обычный window.open. "
+                    + "Telegram для @tsuloew должен вести на https://t.me/tsuloew."
+                )
+
+        if content is None:
+            # Contact/map requests have a safe local implementation. This
+            # prevents a model choosing a forbidden iframe from turning a
+            # valid user request into a failed edit.
+            fallback = build_contact_actions_fallback(current, delta)
+            if fallback:
+                fallback = ensure_initial_render(fallback)
+                fallback_safety = publication_safety_report(fallback)
+                fallback_report = quality_report(fallback)
+                fallback_frontend = static_review(fallback)
+                fallback_browser = browser_smoke(fallback)
+                if (
+                    fallback_safety["passed"]
+                    and fallback_report["score"] >= .75
+                    and fallback_frontend["score"] >= .75
+                    and fallback_browser["passed"]
+                    and not needs_fallback(fallback)
+                ):
+                    content = fallback
+            if content is None:
+                raise RuntimeError("quality: " + ", ".join(validation_errors))
 
         version = max((int(item.get("version", 0)) for item in site.get("versions", [])), default=int(site.get("version", 1))) + 1
         version_dir = SITES_DIR / f"{site_id}--v{version}"
