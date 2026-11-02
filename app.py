@@ -38,7 +38,7 @@ from design_systems import select_design_system
 from browser_qa import browser_smoke
 from generation_validation import validate_candidate
 from contact_actions import build_contact_actions_fallback as build_safe_contact_actions_fallback
-from site_naming import extract_brand_name, set_document_title, site_title, transliterate, unique_requested_slug, unique_site_slug
+from site_naming import set_document_title, site_title, transliterate, unique_requested_slug, unique_site_slug
 from llm_stream import stream_content_piece
 
 load_dotenv()
@@ -284,25 +284,6 @@ def main_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def presets_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="👤 Сайт о себе и работах", callback_data="preset:portfolio"),
-            InlineKeyboardButton(text="🛠 Сайт услуг", callback_data="preset:services"),
-        ],
-        [
-            InlineKeyboardButton(text="🚀 Сайт продукта или проекта", callback_data="preset:project"),
-            InlineKeyboardButton(text="📚 Галерея проектов и кейсов", callback_data="preset:case-study"),
-        ],
-        [
-            InlineKeyboardButton(text="✍️ Свой вариант", callback_data="preset:custom"),
-        ],
-        [
-            InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action"),
-        ]
-    ])
-
-
 def input_cancel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_action")],
@@ -338,18 +319,9 @@ def generation_error_text(exc: Exception) -> str:
     return "Не получилось завершить генерацию. Ваши данные сохранены — попробуйте ещё раз или обратитесь в поддержку."
 
 
-PRESET_BRIEFS = {
-    "portfolio": "Современное личное портфолио специалиста. Покажи кто я, чем занимаюсь, мои ключевые навыки, избранные проекты, процесс работы и способы связи. Используй только факты, которые я укажу, без выдуманных отзывов и цифр.",
-    "services": "Понятная страница услуг специалиста. Покажи кому я помогаю, какие задачи решаю, список услуг, этапы работы, примеры работ и простой способ связаться со мной. Не добавляй цены или гарантии, если я их не указал.",
-    "project": "Сайт собственного цифрового проекта или сервиса. Объясни проблему, решение, ключевые возможности, сценарий использования, ограничения и способ связи или знакомства с проектом. Не выдумывай пользователей, метрики и интеграции.",
-    "case-study": "Витрина клиентских кейсов и выполненных работ. Для каждого кейса покажи задачу, ход работы и результат только на основе информации пользователя. Не выдумывай клиентов, цифры, логотипы и отзывы.",
-}
-
-
 class CreateSite(StatesGroup):
     brief = State()
     slug = State()
-    slug_for_preset = State()
     edit_brief = State()
     chat = State()
 
@@ -364,7 +336,7 @@ async def start(message: Message, state: FSMContext):
     welcome_text = (
         "🚀 <b>Добро пожаловать в Saytli AI!</b>\n\n"
         "Создам и опубликую адаптивный сайт по вашему описанию. Не нужно знать код — просто расскажите, что показать.\n\n"
-        "• <b>✨ Создать сайт</b> — выберите пример или опишите идею своими словами\n"
+        "• <b>✨ Создать сайт</b> — опишите идею своими словами\n"
         "• <b>📁 Мои сайты</b> — просмотр, редактирование и откат версий\n"
         "• <b>💬 AI-консультант</b> — помощь со структурой и текстами\n"
         "• <b>📱 Mini App</b> — открывайте сайты прямо внутри Telegram!"
@@ -397,8 +369,7 @@ async def create_start(event: Message | CallbackQuery, state: FSMContext):
 
     prompt_text = (
         "✨ <b>Создание нового сайта</b>\n\n"
-        "Кнопки ниже — это готовые подсказки по структуре страницы, их можно выбрать, если удобно. "
-        "Они не обязательны: нажмите «Свой вариант» и опишите идею своими словами.\n\n"
+        "Опишите будущий сайт своими словами — AI сам подберёт подходящую структуру.\n\n"
         "После описания я спрошу короткое слово для ссылки, например <code>tsuloit</code> → "
         f"<code>{html.escape(PUBLIC_BASE)}/s/tsuloit</code>.\n\n"
         "Укажите, чем занимаетесь, что показать и как связаться.\n\n"
@@ -407,57 +378,20 @@ async def create_start(event: Message | CallbackQuery, state: FSMContext):
     )
     await state.set_state(CreateSite.brief)
     if isinstance(event, CallbackQuery):
-        await msg.edit_text(prompt_text, reply_markup=presets_keyboard(), parse_mode="HTML")
+        await msg.edit_text(prompt_text, reply_markup=input_cancel_keyboard(), parse_mode="HTML")
     else:
-        await msg.answer(prompt_text, reply_markup=presets_keyboard(), parse_mode="HTML")
+        await msg.answer(prompt_text, reply_markup=input_cancel_keyboard(), parse_mode="HTML")
 
 
-@router.callback_query(F.data.startswith("preset:"))
-async def preset_chosen(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    preset_key = callback.data.split(":", 1)[1]
-    if preset_key == "custom":
-        await state.set_state(CreateSite.brief)
-        await callback.message.edit_text(
-            "✍️ <b>Опишите будущий сайт</b>\n\n"
-            "Напишите одним сообщением: кто вы/ваш проект, для кого сайт, какие разделы нужны, контакты и желаемый стиль. Если чего-то пока нет — пропустите. Можно своими словами.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]),
-            parse_mode="HTML",
-        )
-        return
-    brief = PRESET_BRIEFS.get(preset_key)
-    if not brief:
-        await callback.answer("Не нашёл этот вариант", show_alert=True)
-        await callback.message.answer("Шаблон не найден. Опишите сайт своими словами.")
-        return
-
-    await state.update_data(pending_brief=brief, slug_is_preset=True)
-    await state.set_state(CreateSite.slug_for_preset)
-    await callback.message.edit_text(
-        "🔗 <b>Какое слово использовать в ссылке?</b>\n\n"
-        "Напишите короткое имя латиницей, например <code>tsuloit</code>.\n"
-        f"Ссылка будет выглядеть так: <code>{html.escape(PUBLIC_BASE)}/s/tsuloit</code>.\n\n"
-        "Можно отправить название бренда — кириллицу преобразую в латиницу автоматически.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Использовать имя бренда", callback_data="slug:brand")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")],
-        ]),
-        parse_mode="HTML",
-    )
-
-
-async def _ask_slug(message: Message, state: FSMContext, brief: str, *, preset: bool = False):
-    await state.update_data(pending_brief=brief, slug_is_preset=preset)
-    await state.set_state(CreateSite.slug_for_preset if preset else CreateSite.slug)
+async def _ask_slug(message: Message, state: FSMContext, brief: str):
+    await state.update_data(pending_brief=brief)
+    await state.set_state(CreateSite.slug)
     await message.answer(
         "🔗 <b>Какое слово поставить в адрес сайта?</b>\n\n"
         "Напишите короткое имя для ссылки. Например, <code>tsuloit</code> даст адрес:\n"
         f"<code>{html.escape(PUBLIC_BASE)}/s/tsuloit</code>\n\n"
         "Можно писать кириллицей — преобразую её в латиницу. Если адрес уже занят, добавлю номер, например <code>-2</code>.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Использовать название бренда", callback_data="slug:brand")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")],
-        ]),
+        reply_markup=input_cancel_keyboard(),
         parse_mode="HTML",
     )
 
@@ -479,27 +413,6 @@ async def _launch_generation(
         owner_id or message.from_user.id,
         generate_site(message, status, brief, requested_slug=requested_slug, owner_id=owner_id),
     )
-
-
-@router.callback_query(F.data == "slug:brand")
-async def use_brand_slug(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    data = await state.get_data()
-    brief = data.get("pending_brief", "")
-    if not brief:
-        await state.clear()
-        await callback.message.edit_text("Описание сайта потеряно. Нажмите «Создать сайт» и начните заново.", reply_markup=main_keyboard())
-        return
-    brand = extract_brand_name(brief)
-    if not brand:
-        await callback.message.edit_text(
-            "Не нашёл явное название бренда в описании. Напишите желаемое слово для ссылки отдельно, например <code>tsuloit</code>.",
-            reply_markup=input_cancel_keyboard(),
-            parse_mode="HTML",
-        )
-        await state.set_state(CreateSite.slug_for_preset if data.get("slug_is_preset") else CreateSite.slug)
-        return
-    await _launch_generation(callback.message, state, brief, brand, owner_id=callback.from_user.id)
 
 
 async def _receive_slug(message: Message, state: FSMContext):
@@ -528,9 +441,6 @@ async def receive_custom_slug(message: Message, state: FSMContext):
     await _receive_slug(message, state)
 
 
-@router.message(CreateSite.slug_for_preset)
-async def receive_preset_slug(message: Message, state: FSMContext):
-    await _receive_slug(message, state)
 
 
 @router.message(Command("cancel"))
@@ -590,16 +500,9 @@ async def help_command(event: Message | CallbackQuery):
         "ℹ️ <b>Возможности и команды Saytli AI</b>\n\n"
         "<b>Как создать сайт:</b>\n"
         "1. Нажмите «Создать сайт».\n"
-        "2. Выберите понятную подсказку по структуре или «Свой вариант».\n"
-        "3. Напишите, кто вы, что показать, контакты и желаемый стиль.\n"
-        "4. Укажите слово для короткой ссылки, например saytli-ai.ru/s/tsuloit.\n"
-        "5. Подождите результат — готовая ссылка появится в этом чате.\n\n"
-        "<b>Что означают подсказки:</b>\n"
-        "• «Сайт о себе и работах» — личная страница специалиста с опытом и проектами.\n"
-        "• «Сайт услуг» — объясняет, чем вы помогаете клиентам и как обратиться.\n"
-        "• «Сайт продукта или проекта» — рассказывает о сервисе, приложении или идее.\n"
-        "• «Галерея проектов и кейсов» — показывает выполненные работы по схеме задача → решение → результат.\n"
-        "Это только стартовая структура, а не ограничение. Для полного контроля выбирайте «Свой вариант».\n\n"
+        "2. Опишите, кто вы, что показать, контакты и желаемый стиль.\n"
+        "3. Введите слово для короткой ссылки, например saytli-ai.ru/s/tsuloit.\n"
+        "4. Дождитесь публикации — ссылка появится в этом чате.\n\n"
         "<b>Команды:</b> /create — создать · /sites — мои сайты · /chat — спросить AI · /cancel — отмена\n\n"
         "<b>Ключевые фичи:</b>\n"
         "✓ <b>Telegram Mini Apps</b> — мгновенный просмотр сайта прямо в боте.\n"
