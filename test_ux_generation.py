@@ -7,6 +7,7 @@ from generation_validation import validate_candidate
 from pipeline import static_review
 from quality import publication_safety_report
 from responsive_qa import responsive_report
+from site_naming import extract_brand_name, set_document_title, site_title, unique_site_slug
 from skills import choose_skills
 
 
@@ -32,6 +33,20 @@ class UXGenerationTests(unittest.TestCase):
         for brief, expected in scenarios.items():
             with self.subTest(brief=brief):
                 self.assertIn(expected, [skill.name for skill in choose_skills(brief)])
+
+    def test_brand_name_creates_short_logical_slug_and_title(self):
+        brief = "Я владелец компании CuloStore. Мы продаём товары для дома, нужен современный сайт."
+        self.assertEqual(extract_brand_name(brief), "CuloStore")
+        self.assertEqual(site_title(brief), "CuloStore")
+        self.assertEqual(unique_site_slug(brief, []), "culostore")
+        self.assertEqual(unique_site_slug(brief, ["culostore"]), "culostore-2")
+
+    def test_russian_brand_and_fallback_titles_are_readable(self):
+        self.assertEqual(site_title("Компания называется «Дом Света», сделай сайт услуг."), "Дом Света")
+        self.assertEqual(unique_site_slug("Компания называется «Дом Света», сделай сайт услуг.", []), "dom-sveta")
+        self.assertEqual(site_title("Я фотограф, покажи мои работы и контакты."), "Портфолио")
+        document = "<html><head><title>Старое название</title></head><body></body></html>"
+        self.assertIn("<title>CuloStore</title>", set_document_title(document, "CuloStore"))
 
     def test_valid_model_candidate_is_accepted(self):
         result = validate_candidate(BASE_HTML.replace(

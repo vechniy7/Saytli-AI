@@ -38,6 +38,7 @@ from design_systems import select_design_system
 from browser_qa import browser_smoke
 from generation_validation import validate_candidate
 from contact_actions import build_contact_actions_fallback as build_safe_contact_actions_fallback
+from site_naming import set_document_title, site_title, unique_site_slug
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -601,12 +602,13 @@ async def generate_site(message: Message, status: Message, brief: str):
     ]
     try:
         await progress(status, stages, 0)
-        site_id = slugify(brief[:18])[:18] + "-" + secrets.token_hex(4)
+        site_name = site_title(brief)
         skill_names, prompt = build_skill_prompt(brief)
         design = select_design_system(skill_names)
         await progress(status, stages, 1)
         prompt += (
             f"\n\nART DIRECTION SYSTEM (must follow): {json.dumps(design, ensure_ascii=False)}\n"
+            f"НАЗВАНИЕ САЙТА: используй название «{site_name}» как основной бренд в title, hero и навигации. Не заменяй его случайной фразой из брифа и не добавляй слово 'сайт' к названию бренда без необходимости.\n"
             "Выбери визуальную систему осознанно и не смешивай её с generic SaaS шаблонами.\n\n"
             "ПУБЛИКАЦИЯ: не добавляй поверх сайта баннеры или надписи 'ДЕМО-РЕЖИМ', 'Demo mode', 'Local demo mode', 'no real payment'. "
             "Интерфейс должен выглядеть как законченный продукт. Не выдумывай факт реального backend: "
@@ -674,6 +676,7 @@ async def generate_site(message: Message, status: Message, brief: str):
         if content is None:
             raise RuntimeError("Generated content failed validation: " + ", ".join(validation_errors))
 
+        content = set_document_title(content, site_name)
         await progress(status, stages, 3)
 
         logger.info(
@@ -681,12 +684,18 @@ async def generate_site(message: Message, status: Message, brief: str):
             report["score"], frontend_report["score"], browser_report["passed"]
         )
         await progress(status, stages, 4)
+        db = load_db()
+        site_id = unique_site_slug(brief, db.get("sites", {}).keys())
         folder = SITES_DIR / site_id
+        while folder.exists():
+            site_id = unique_site_slug(brief, [*db.get("sites", {}).keys(), site_id])
+            folder = SITES_DIR / site_id
         folder.mkdir(parents=True, exist_ok=False)
         (folder / "index.html").write_text(content, encoding="utf-8")
 
         site_record = {
             "owner": message.from_user.id,
+            "title": site_name,
             "brief": brief,
             "skills": skill_names,
             "design_system": design["id"],
@@ -700,7 +709,7 @@ async def generate_site(message: Message, status: Message, brief: str):
 
         url = f"{PUBLIC_BASE}/s/{site_id}"
         result_text = (
-            f"🎉 <b>Ваш сайт успешно создан и опубликован!</b>\n\n"
+            f"🎉 <b>{html.escape(site_name)} — сайт опубликован!</b>\n\n"
             f"🌐 <b>Адрес:</b> {url}\n"
             f"🎨 <b>Дизайн:</b> <code>{design['id']}</code>\n"
             f"✨ <b>Стиль:</b> <code>{' · '.join(skill_names)}</code>\n\n"
@@ -763,10 +772,11 @@ async def list_sites(event: Message | CallbackQuery):
     for idx, (sid, item) in enumerate(owned[:8], 1):
         v = item.get("version", 1)
         brief_short = html.escape((item.get("brief", "") or sid)[:36])
-        site_lines.append(f"<b>{idx}.</b> <code>{sid}</code> [v{v}]\n   <i>{brief_short}...</i>")
+        title = html.escape(item.get("title") or site_title(item.get("brief", "")) or sid)
+        site_lines.append(f"<b>{idx}.</b> <b>{title}</b> [v{v}]\n   <i>{brief_short}...</i>")
         k = site_key(sid)
         buttons.append([
-            InlineKeyboardButton(text=f"🌐 {idx}. {sid[:18]}", callback_data=f"view:{k}")
+            InlineKeyboardButton(text=f"🌐 {idx}. {(item.get('title') or site_title(item.get('brief', '')) or sid)[:28]}", callback_data=f"view:{k}")
         ])
 
     buttons.append([
@@ -803,7 +813,7 @@ async def view_site_card(callback: CallbackQuery):
     url = f"{PUBLIC_BASE}/s/{site_id}"
 
     text = (
-        f"🌐 <b>Сайт:</b> <code>{html.escape(site_id)}</code>\n"
+        f"🌐 <b>Сайт:</b> {html.escape(site.get('title') or site_title(site.get('brief', '')) or site_id)}\n"
         f"📊 <b>Версия:</b> v{v}\n"
         f"🎨 <b>Дизайн:</b> <code>{html.escape(site.get('design_system', 'modern'))}</code>\n"
         f"✨ <b>Skills:</b> <code>{html.escape(skills)}</code>\n"
