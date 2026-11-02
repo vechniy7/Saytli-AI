@@ -39,6 +39,7 @@ from browser_qa import browser_smoke
 from generation_validation import validate_candidate
 from contact_actions import build_contact_actions_fallback as build_safe_contact_actions_fallback
 from site_naming import set_document_title, site_title, unique_site_slug
+from llm_stream import stream_content_piece
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -47,8 +48,9 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 LLM_KEY = os.environ.get("LLM_ROUTER_API_KEY", "")
 LLM_BASE = os.environ.get("LLM_ROUTER_BASE_URL", "https://llm-router.org/v1").rstrip("/")
 MODEL = os.environ.get("LLM_MODEL", "gpt-6-luna")
-GENERATION_TIMEOUT_SECONDS = float(os.environ.get("GENERATION_TIMEOUT_SECONDS", "180"))
+GENERATION_TIMEOUT_SECONDS = float(os.environ.get("GENERATION_TIMEOUT_SECONDS", "300"))
 GENERATION_ATTEMPTS = max(1, int(os.environ.get("GENERATION_ATTEMPTS", "2")))
+GENERATION_MAX_TOKENS = max(4000, int(os.environ.get("GENERATION_MAX_TOKENS", "10000")))
 PUBLIC_BASE = os.environ.get("PUBLIC_BASE_URL", "https://saytli-ai.ru").rstrip("/")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
 SITES_DIR = DATA_DIR / "sites"
@@ -58,6 +60,43 @@ SITES_DIR.mkdir(parents=True, exist_ok=True)
 _db_lock = threading.Lock()
 DB_LOCK_FILE = DATA_DIR / "sites.json.lock"
 _active_tasks: dict[int, asyncio.Task] = {}
+
+
+async def request_llm(payload: dict) -> str:
+    """Request model output incrementally instead of waiting for one huge body.
+
+    Static HTML can be several thousand tokens long.  A non-streaming request
+    makes httpx wait for the complete document before returning any response,
+    so a slow-but-healthy gateway looks exactly like a dead gateway.  Streaming
+    keeps the read timeout as an inactivity guard while allowing long renders
+    to complete.
+    """
+    streamed_payload = {**payload, "stream": True}
+    timeout = httpx.Timeout(GENERATION_TIMEOUT_SECONDS, connect=20.0)
+    chunks: list[str] = []
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with client.stream(
+            "POST",
+            f"{LLM_BASE}/chat/completions",
+            headers={"Authorization": f"Bearer {LLM_KEY}"},
+            json=streamed_payload,
+        ) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                line = line.strip()
+                if not line or line.startswith(":"):
+                    continue
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+                if line == "[DONE]":
+                    break
+                piece = stream_content_piece(line)
+                if isinstance(piece, str):
+                    chunks.append(piece)
+    content = "".join(chunks)
+    if not content.strip():
+        raise ValueError("LLM returned an empty streamed response")
+    return content
 
 
 def _remember_task(user_id: int, task: asyncio.Task) -> None:
@@ -627,7 +666,7 @@ async def generate_site(message: Message, status: Message, brief: str):
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.7,
-            "max_tokens": 12000
+            "max_tokens": GENERATION_MAX_TOKENS
         }
         content = None
         last_error = None
@@ -635,36 +674,30 @@ async def generate_site(message: Message, status: Message, brief: str):
         validation_errors = []
         for attempt in range(GENERATION_ATTEMPTS):
             try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(GENERATION_TIMEOUT_SECONDS, connect=20.0)) as client:
-                    response = await client.post(
-                        f"{LLM_BASE}/chat/completions",
-                        headers={"Authorization": f"Bearer {LLM_KEY}"},
-                        json=request_payload
+                candidate = await request_llm(request_payload)
+                last_error = None
+                validation = validate_candidate(candidate)
+                candidate = validation["candidate"]
+                validation_errors = validation["errors"]
+                logger.info(
+                    "generation attempt=%s accepted=%s validation_errors=%s responsive=%s",
+                    attempt + 1,
+                    validation["accepted"],
+                    ",".join(validation_errors) or "none",
+                    ",".join(validation.get("responsive", {}).get("errors", [])) or "ok",
+                )
+                if validation["accepted"]:
+                    content = candidate
+                    safety_report = validation["safety"]
+                    report = validation["quality"]
+                    frontend_report = validation["frontend"]
+                    browser_report = validation["browser"]
+                    break
+                if attempt < GENERATION_ATTEMPTS - 1:
+                    request_payload["messages"][1]["content"] = (
+                        prompt + "\n\nПредыдущий вариант не прошёл проверки: " + ", ".join(validation_errors)
+                        + ". Исправь конкретно эти причины и верни полный HTML-документ. Особенно проверь ширину 320px: grid/flex должны перестраиваться, изображения не должны выходить за экран, меню и кнопки должны быть доступны пальцем. Не используй iframe/object/embed, внешние script-теги или сетевые запросы из JavaScript."
                     )
-                    response.raise_for_status()
-                    last_error = None
-                    validation = validate_candidate(response.json()["choices"][0]["message"].get("content"))
-                    candidate = validation["candidate"]
-                    validation_errors = validation["errors"]
-                    logger.info(
-                        "generation attempt=%s accepted=%s validation_errors=%s responsive=%s",
-                        attempt + 1,
-                        validation["accepted"],
-                        ",".join(validation_errors) or "none",
-                        ",".join(validation.get("responsive", {}).get("errors", [])) or "ok",
-                    )
-                    if validation["accepted"]:
-                        content = candidate
-                        safety_report = validation["safety"]
-                        report = validation["quality"]
-                        frontend_report = validation["frontend"]
-                        browser_report = validation["browser"]
-                        break
-                    if attempt < GENERATION_ATTEMPTS - 1:
-                        request_payload["messages"][1]["content"] = (
-                            prompt + "\n\nПредыдущий вариант не прошёл проверки: " + ", ".join(validation_errors)
-                            + ". Исправь конкретно эти причины и верни полный HTML-документ. Особенно проверь ширину 320px: grid/flex должны перестраиваться, изображения не должны выходить за экран, меню и кнопки должны быть доступны пальцем. Не используй iframe/object/embed, внешние script-теги или сетевые запросы из JavaScript."
-                        )
             except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as exc:
                 last_error = exc
                 if attempt < GENERATION_ATTEMPTS - 1:
@@ -943,14 +976,7 @@ async def edit_site(message: Message, status: Message, site_id: str, delta: str)
         content = None
         validation_errors = []
         for attempt in range(GENERATION_ATTEMPTS):
-            async with httpx.AsyncClient(timeout=httpx.Timeout(GENERATION_TIMEOUT_SECONDS, connect=20.0)) as client:
-                response = await client.post(
-                    f"{LLM_BASE}/chat/completions",
-                    headers={"Authorization": f"Bearer {LLM_KEY}"},
-                    json=request_payload
-                )
-                response.raise_for_status()
-                candidate = response.json()["choices"][0]["message"].get("content")
+            candidate = await request_llm(request_payload)
 
             validation = validate_candidate(candidate)
             candidate = validation["candidate"]

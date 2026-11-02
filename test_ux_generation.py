@@ -8,6 +8,7 @@ from pipeline import static_review
 from quality import publication_safety_report
 from responsive_qa import responsive_report
 from site_naming import extract_brand_name, set_document_title, site_title, unique_site_slug
+from llm_stream import stream_content_piece
 from skills import choose_skills
 
 
@@ -112,6 +113,17 @@ class UXGenerationTests(unittest.TestCase):
         )
         report = responsive_report(document)
         self.assertTrue(report["passed"], report)
+
+    def test_stream_content_piece_supports_sse_delta_and_json_fallback(self):
+        self.assertEqual(
+            stream_content_piece('data: {"choices":[{"delta":{"content":"<html>"}}]}'),
+            "<html>",
+        )
+        self.assertEqual(
+            stream_content_piece('{"choices":[{"message":{"content":"<body>"}}]}'),
+            "<body>",
+        )
+        self.assertIsNone(stream_content_piece("[DONE]"))
 
     def test_invalid_first_candidate_is_rejected_with_actionable_reasons(self):
         result = validate_candidate("```html\n<iframe src='https://example.com'></iframe>\n```")
