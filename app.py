@@ -462,7 +462,13 @@ async def _ask_slug(message: Message, state: FSMContext, brief: str, *, preset: 
     )
 
 
-async def _launch_generation(message: Message, state: FSMContext, brief: str, requested_slug: str | None):
+async def _launch_generation(
+    message: Message,
+    state: FSMContext,
+    brief: str,
+    requested_slug: str | None,
+    owner_id: int | None = None,
+):
     await state.clear()
     status = await message.answer(
         "⚡ <b>Запуск генерации сайта</b>\n\nПодключаюсь к дизайн-системе...",
@@ -470,8 +476,8 @@ async def _launch_generation(message: Message, state: FSMContext, brief: str, re
         parse_mode="HTML",
     )
     _start_background_task(
-        message.from_user.id,
-        generate_site(message, status, brief, requested_slug=requested_slug),
+        owner_id or message.from_user.id,
+        generate_site(message, status, brief, requested_slug=requested_slug, owner_id=owner_id),
     )
 
 
@@ -493,7 +499,7 @@ async def use_brand_slug(callback: CallbackQuery, state: FSMContext):
         )
         await state.set_state(CreateSite.slug_for_preset if data.get("slug_is_preset") else CreateSite.slug)
         return
-    await _launch_generation(callback.message, state, brief, brand)
+    await _launch_generation(callback.message, state, brief, brand, owner_id=callback.from_user.id)
 
 
 async def _receive_slug(message: Message, state: FSMContext):
@@ -716,7 +722,13 @@ async def progress(status: Message, stages: list[str], current: int):
         logger.debug("could not update generation progress", exc_info=True)
 
 
-async def generate_site(message: Message, status: Message, brief: str, requested_slug: str | None = None):
+async def generate_site(
+    message: Message,
+    status: Message,
+    brief: str,
+    requested_slug: str | None = None,
+    owner_id: int | None = None,
+):
     stages = [
         "Анализ задачи и подбор структуры",
         "Выбор дизайн-системы и палитры",
@@ -828,7 +840,7 @@ async def generate_site(message: Message, status: Message, brief: str, requested
         (folder / "index.html").write_text(content, encoding="utf-8")
 
         site_record = {
-            "owner": message.from_user.id,
+            "owner": owner_id or message.from_user.id,
             "title": site_name,
             "brief": brief,
             "skills": skill_names,
