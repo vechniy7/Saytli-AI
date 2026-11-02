@@ -5,6 +5,7 @@ from browser_qa import browser_smoke
 from pipeline import static_review
 from quality import ensure_initial_render, needs_fallback, publication_safety_report, quality_report
 from responsive_qa import responsive_report
+from generation_repair import repair_candidate
 
 
 def validate_candidate(raw: object) -> dict:
@@ -16,7 +17,7 @@ def validate_candidate(raw: object) -> dict:
     if not re.search(r"<html[\s>]|<!doctype html", candidate, re.I):
         return {"accepted": False, "candidate": candidate, "errors": ["not_html_document"]}
 
-    candidate = ensure_initial_render(candidate)
+    candidate = repair_candidate(ensure_initial_render(candidate))
     safety = publication_safety_report(candidate)
     quality = quality_report(candidate)
     frontend = static_review(candidate)

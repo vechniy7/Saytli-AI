@@ -4,6 +4,7 @@ import unittest
 from browser_qa import browser_smoke
 from contact_actions import build_contact_actions_fallback
 from generation_validation import validate_candidate
+from generation_repair import repair_candidate
 from pipeline import static_review
 from quality import publication_safety_report
 from responsive_qa import responsive_report
@@ -129,6 +130,18 @@ class UXGenerationTests(unittest.TestCase):
             "<body>",
         )
         self.assertIsNone(stream_content_piece("[DONE]"))
+
+    def test_generation_repair_removes_embed_and_fixed_mobile_overflow(self):
+        broken = BASE_HTML.replace(
+            "</main>",
+            '<iframe src="https://maps.example"></iframe><div style="width:1200px">Карта</div></main>',
+        )
+        repaired = repair_candidate(broken)
+        self.assertNotIn("<iframe", repaired.lower())
+        self.assertIn("Открыть внешний материал", repaired)
+        self.assertNotIn("width:1200px", repaired.replace(" ", "").lower())
+        result = validate_candidate(broken)
+        self.assertTrue(result["accepted"], result["errors"])
 
     def test_invalid_first_candidate_is_rejected_with_actionable_reasons(self):
         result = validate_candidate("```html\n<iframe src='https://example.com'></iframe>\n```")
