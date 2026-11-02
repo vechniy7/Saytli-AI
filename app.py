@@ -47,6 +47,8 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 LLM_KEY = os.environ.get("LLM_ROUTER_API_KEY", "")
 LLM_BASE = os.environ.get("LLM_ROUTER_BASE_URL", "https://llm-router.org/v1").rstrip("/")
 MODEL = os.environ.get("LLM_MODEL", "gpt-6-luna")
+GENERATION_TIMEOUT_SECONDS = float(os.environ.get("GENERATION_TIMEOUT_SECONDS", "180"))
+GENERATION_ATTEMPTS = max(1, int(os.environ.get("GENERATION_ATTEMPTS", "2")))
 PUBLIC_BASE = os.environ.get("PUBLIC_BASE_URL", "https://saytli-ai.ru").rstrip("/")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
 SITES_DIR = DATA_DIR / "sites"
@@ -631,9 +633,9 @@ async def generate_site(message: Message, status: Message, brief: str):
         last_error = None
         await progress(status, stages, 2)
         validation_errors = []
-        for attempt in range(3):
+        for attempt in range(GENERATION_ATTEMPTS):
             try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=20.0)) as client:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(GENERATION_TIMEOUT_SECONDS, connect=20.0)) as client:
                     response = await client.post(
                         f"{LLM_BASE}/chat/completions",
                         headers={"Authorization": f"Bearer {LLM_KEY}"},
@@ -644,6 +646,13 @@ async def generate_site(message: Message, status: Message, brief: str):
                     validation = validate_candidate(response.json()["choices"][0]["message"].get("content"))
                     candidate = validation["candidate"]
                     validation_errors = validation["errors"]
+                    logger.info(
+                        "generation attempt=%s accepted=%s validation_errors=%s responsive=%s",
+                        attempt + 1,
+                        validation["accepted"],
+                        ",".join(validation_errors) or "none",
+                        ",".join(validation.get("responsive", {}).get("errors", [])) or "ok",
+                    )
                     if validation["accepted"]:
                         content = candidate
                         safety_report = validation["safety"]
@@ -651,25 +660,25 @@ async def generate_site(message: Message, status: Message, brief: str):
                         frontend_report = validation["frontend"]
                         browser_report = validation["browser"]
                         break
-                    if attempt < 2:
+                    if attempt < GENERATION_ATTEMPTS - 1:
                         request_payload["messages"][1]["content"] = (
                             prompt + "\n\nПредыдущий вариант не прошёл проверки: " + ", ".join(validation_errors)
                             + ". Исправь конкретно эти причины и верни полный HTML-документ. Особенно проверь ширину 320px: grid/flex должны перестраиваться, изображения не должны выходить за экран, меню и кнопки должны быть доступны пальцем. Не используй iframe/object/embed, внешние script-теги или сетевые запросы из JavaScript."
                         )
             except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as exc:
                 last_error = exc
-                if attempt < 2:
+                if attempt < GENERATION_ATTEMPTS - 1:
                     request_payload["messages"][1]["content"] = (
                         prompt + "\n\nСделай реализацию как цельный single-page HTML-портфолио с рабочей навигацией и frontend-интерактивностью; не описывай backend-код."
                     )
             except httpx.HTTPStatusError as exc:
                 last_error = exc
-                if exc.response.status_code not in (429, 500, 502, 503, 504) or attempt == 2:
+                if exc.response.status_code not in (429, 500, 502, 503, 504) or attempt == GENERATION_ATTEMPTS - 1:
                     raise
                 await asyncio.sleep(1.5 * (attempt + 1))
             except (ValueError, KeyError, TypeError) as exc:
                 last_error = exc
-                if attempt < 2:
+                if attempt < GENERATION_ATTEMPTS - 1:
                     request_payload["messages"][1]["content"] = prompt + "\n\nПредыдущий ответ оказался некорректным. Верни только полный самодостаточный HTML-документ."
         if content is None and last_error:
             raise last_error or RuntimeError("LLM did not return content")
@@ -933,8 +942,8 @@ async def edit_site(message: Message, status: Message, site_id: str, delta: str)
         # repair attempt instead of immediately discarding an otherwise useful edit.
         content = None
         validation_errors = []
-        for attempt in range(2):
-            async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=20.0)) as client:
+        for attempt in range(GENERATION_ATTEMPTS):
+            async with httpx.AsyncClient(timeout=httpx.Timeout(GENERATION_TIMEOUT_SECONDS, connect=20.0)) as client:
                 response = await client.post(
                     f"{LLM_BASE}/chat/completions",
                     headers={"Authorization": f"Bearer {LLM_KEY}"},
@@ -946,6 +955,13 @@ async def edit_site(message: Message, status: Message, site_id: str, delta: str)
             validation = validate_candidate(candidate)
             candidate = validation["candidate"]
             validation_errors = list(validation["errors"])
+            logger.info(
+                "edit attempt=%s accepted=%s validation_errors=%s responsive=%s",
+                attempt + 1,
+                validation["accepted"],
+                ",".join(validation_errors) or "none",
+                ",".join(validation.get("responsive", {}).get("errors", [])) or "ok",
+            )
             safety_report = validation.get("safety", {"passed": False})
             report = validation.get("quality", {"score": 0})
             frontend_report = validation.get("frontend", {"score": 0})
@@ -965,7 +981,7 @@ async def edit_site(message: Message, status: Message, site_id: str, delta: str)
                 content = candidate
                 break
 
-            if attempt == 0:
+            if attempt < GENERATION_ATTEMPTS - 1:
                 request_payload["messages"][1]["content"] = (
                     prompt
                     + "\n\nПРЕДЫДУЩИЙ ВАРИАНТ ОТКЛОНЁН ПРОВЕРКОЙ. "

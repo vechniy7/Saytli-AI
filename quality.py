@@ -38,7 +38,7 @@ def quality_report(html: str) -> dict:
         "has_viewport": bool(re.search(r"name=[\"']viewport[\"']", html, re.I)),
         "has_body_content": bool(re.search(r"<body[^>]*>[\s\S]{300,}</body>", html, re.I)),
         "has_sections": len(re.findall(r"<(?:section|main|article|header|footer|nav)\b", html, re.I)) >= 3,
-        "has_responsive_css": bool(re.search(r"@media\s*\(", html, re.I)),
+        "has_responsive_css": bool(re.search(r"@media\b[^{}]*\(", html, re.I)),
         "no_markdown_fence": "```" not in html,
         "not_error_page": not any(x in low for x in ("unable to generate", "generation failed", "i cannot")),
     }

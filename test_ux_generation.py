@@ -74,6 +74,45 @@ class UXGenerationTests(unittest.TestCase):
         self.assertFalse(result["accepted"])
         self.assertTrue(any(error.startswith("responsive:") for error in result["errors"]))
 
+    def test_responsive_validation_accepts_common_css_formatting_variants(self):
+        document = """<!doctype html><html><head>
+        <title>TsuloIT</title><meta name="viewport" content="width=device-width">
+        <style>
+          html, body { box-sizing: border-box; }
+          *, *::before, *::after { box-sizing: inherit; }
+          img, svg { max-width: 100%; height: auto; }
+          .shell { width: min(100% - 2rem, 72rem); }
+          .cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+          @media screen and (max-width: 700px) {
+            .cards {
+              grid-template-columns: repeat(1, minmax(0, 1fr));
+              gap: 1rem;
+            }
+            .menu { display: none; }
+          }
+        </style></head><body><header><nav class="menu">Menu</nav></header>
+        <main class="shell"><section><h1>Заголовок страницы</h1>
+        <p>Подробное описание услуги, процесса и следующего шага для клиента.</p></section>
+        <section><h2>Услуги</h2><p>Полезная информация о работе и результате.</p></section>
+        <section><h2>Контакты</h2><p>Свяжитесь с нами для обсуждения задачи.</p></section></main>
+        <script>document.querySelector('nav').addEventListener('click', function () {});</script>
+        </body></html>"""
+        report = responsive_report(document)
+        self.assertTrue(report["passed"], report)
+        validation = validate_candidate(document)
+        self.assertTrue(validation["accepted"], validation["errors"])
+
+    def test_viewport_attribute_order_does_not_change_result(self):
+        document = BASE_HTML.replace(
+            '<meta name="viewport" content="width=device-width">',
+            '<meta content="width=device-width, initial-scale=1" name="viewport">',
+        ).replace(
+            '<style>:focus-visible',
+            '<style>*, *::before, *::after { box-sizing: border-box; } img { max-width: 100%; } .wrap { max-width: 72rem; width: 100%; } @media screen and (max-width: 48rem) { main { display: block; } } :focus-visible',
+        )
+        report = responsive_report(document)
+        self.assertTrue(report["passed"], report)
+
     def test_invalid_first_candidate_is_rejected_with_actionable_reasons(self):
         result = validate_candidate("```html\n<iframe src='https://example.com'></iframe>\n```")
         self.assertFalse(result["accepted"])
