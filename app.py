@@ -33,7 +33,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from dotenv import load_dotenv
 from skills import build_skill_prompt
 from quality import ensure_initial_render, quality_report, needs_fallback, publication_safety_report
-from pipeline import static_review
+from pipeline import REVIEW_SYSTEM, parse_review, static_review
 from browser_qa import browser_smoke
 from generation_validation import validate_candidate
 from generation_repair import build_safe_fallback_site
@@ -636,7 +636,7 @@ async def generate_site(
         "Анализ задачи и подбор структуры",
         "Самостоятельная арт-дирекция AI",
         "Генерация адаптивного кода и контента",
-        "Проверка верстки, скриптов и безопасности",
+        "AI-polish: интерактивность, motion и QA",
         "Публикация и запуск страницы",
     ]
     try:
@@ -694,14 +694,14 @@ async def generate_site(
                     break
                 if attempt < GENERATION_ATTEMPTS - 1:
                     request_payload["messages"][1]["content"] = (
-                        prompt + "\n\nПредыдущий вариант не прошёл проверки: " + ", ".join(validation_errors)
-                        + ". Исправь конкретно эти причины и верни полный HTML-документ. Особенно проверь ширину 320px: grid/flex должны перестраиваться, изображения не должны выходить за экран, меню и кнопки должны быть доступны пальцем. Не используй iframe/object/embed, внешние script-теги или сетевые запросы из JavaScript."
+                        prompt + "\n\nПредыдущий вариант не прошёл только техническую проверку: " + ", ".join(validation_errors)
+                        + ". Сохрани выбранную арт-дирекцию и композицию, верни полный HTML-документ. Исправь только перечисленные причины. Проверь ширину 320px, рабочие кнопки и ссылки, motion с prefers-reduced-motion. Не используй iframe/object/embed, внешние script-теги или сетевые запросы из JavaScript."
                     )
             except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as exc:
                 last_error = exc
                 if attempt < GENERATION_ATTEMPTS - 1:
                     request_payload["messages"][1]["content"] = (
-                        prompt + "\n\nСделай реализацию как цельный single-page HTML-портфолио с рабочей навигацией и frontend-интерактивностью; не описывай backend-код."
+                        prompt + "\n\nПовтори тот же индивидуальный дизайн как полный самодостаточный HTML-документ; сохрани смысл брифа, добавь рабочие frontend-сценарии и не описывай backend-код."
                     )
             except httpx.HTTPStatusError as exc:
                 last_error = exc
@@ -732,13 +732,50 @@ async def generate_site(
                 ",".join(validation_errors) or "unknown",
             )
 
+        # Run a separate design-preserving polish pass. It is allowed to fix
+        # dead controls and missing motion, but the original candidate remains
+        # the fallback if the reviewer returns malformed or unsafe HTML.
         await progress(status, stages, 3)
+        if content and LLM_KEY:
+            try:
+                review_payload = {
+                    "model": MODEL,
+                    "messages": [
+                        {"role": "system", "content": REVIEW_SYSTEM},
+                        {"role": "user", "content": f"Описание проекта:\n{brief}\n\nИсходный HTML:\n{content}"},
+                    ],
+                    "temperature": 0.3,
+                    "max_tokens": max(GENERATION_MAX_TOKENS, 16000),
+                }
+                reviewed_raw = await request_llm(review_payload)
+                reviewed, review_meta = parse_review(reviewed_raw, content)
+                reviewed_validation = validate_candidate(reviewed)
+                if reviewed_validation["accepted"]:
+                    content = reviewed_validation["candidate"]
+                    safety_report = reviewed_validation["safety"]
+                    report = reviewed_validation["quality"]
+                    frontend_report = reviewed_validation["frontend"]
+                    browser_report = reviewed_validation["browser"]
+                    logger.info(
+                        "design polish applied score=%s issues=%s experience=%s",
+                        review_meta.get("score", "n/a"),
+                        ",".join(review_meta.get("issues", [])) or "none",
+                        static_review(content).get("experience", {}).get("score", "n/a"),
+                    )
+                else:
+                    logger.warning("design polish rejected; keeping original errors=%s", ",".join(reviewed_validation["errors"]))
+            except Exception as exc:
+                # Polishing is best-effort. A reviewer/API failure must never
+                # discard an already validated original page.
+                logger.warning("design polish unavailable; keeping original: %s", type(exc).__name__)
+
+        await progress(status, stages, 4)
 
         logger.info(
             "site quality score=%s frontend_score=%s browser=%s",
             report["score"], frontend_report["score"], browser_report["passed"]
         )
-        await progress(status, stages, 4)
+        await progress(status, stages, 5)
         db = load_db()
         site_id = (
             unique_requested_slug(requested_slug, db.get("sites", {}).keys())

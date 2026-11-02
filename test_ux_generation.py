@@ -1,4 +1,5 @@
 """Offline contract tests for generation scenarios and recovery paths."""
+import json
 import unittest
 
 from browser_qa import browser_smoke
@@ -6,6 +7,7 @@ from contact_actions import build_contact_actions_fallback
 from generation_validation import validate_candidate
 from generation_repair import build_safe_fallback_site
 from pipeline import static_review
+from pipeline import experience_report, parse_review
 from quality import publication_safety_report
 from responsive_qa import responsive_report
 from site_naming import extract_brand_name, set_document_title, site_title, unique_requested_slug, unique_site_slug
@@ -166,6 +168,34 @@ class UXGenerationTests(unittest.TestCase):
         result = validate_candidate(fallback)
         self.assertTrue(result["accepted"], result["errors"])
         self.assertIn("Дом Света", fallback)
+
+    def test_experience_report_detects_motion_and_working_controls(self):
+        polished = BASE_HTML.replace(
+            "</style>",
+            "@keyframes rise { from { opacity: 0; } to { opacity: 1; } } .card { animation: rise .6s ease both; transition: transform .2s; } @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } } :focus-visible { outline: 2px solid currentColor; }</style>",
+        ).replace(
+            "<script>",
+            "<button type=\"button\" id=\"open\">Открыть</button><script>",
+        ).replace(
+            "</script>",
+            "document.querySelector('#open').addEventListener('click', function () {});</script>",
+        )
+        report = experience_report(polished)
+        self.assertTrue(report["checks"]["has_motion"])
+        self.assertTrue(report["checks"]["reduced_motion_support"])
+        self.assertTrue(report["checks"]["controls_have_event_wiring"])
+        self.assertTrue(report["checks"]["button_semantics"])
+
+    def test_review_parser_accepts_json_fences(self):
+        raw = "```json\n" + json.dumps({"score": 9, "issues": [], "fixed_html": BASE_HTML}) + "\n```"
+        candidate, meta = parse_review(raw, BASE_HTML)
+        self.assertEqual(candidate, BASE_HTML)
+        self.assertEqual(meta["score"], 9)
+
+    def test_static_review_exposes_experience_signals(self):
+        report = static_review(BASE_HTML)
+        self.assertIn("experience", report)
+        self.assertIn("has_motion", report["experience"]["checks"])
 
     def test_invalid_first_candidate_is_rejected_with_actionable_reasons(self):
         result = validate_candidate("```html\n<iframe src='https://example.com'></iframe>\n```")
