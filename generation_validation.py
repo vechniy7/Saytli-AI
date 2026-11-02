@@ -3,13 +3,18 @@ import re
 
 from browser_qa import browser_smoke
 from pipeline import static_review
-from quality import ensure_initial_render, needs_fallback, publication_safety_report, quality_report
+from quality import ensure_initial_render, publication_safety_report, quality_report
 from responsive_qa import responsive_report
 from generation_repair import repair_candidate
 
 
 def validate_candidate(raw: object) -> dict:
-    """Normalize and validate one model response without network or bot state."""
+    """Normalize one model response.
+
+    Publication safety and a non-empty HTML document are hard gates. Visual
+    quality, interaction and responsive heuristics are reported as warnings so
+    a useful site is not discarded because a model omitted one CSS convention.
+    """
     if not isinstance(raw, str) or not raw.strip():
         return {"accepted": False, "candidate": "", "errors": ["empty_response"]}
 
@@ -23,32 +28,30 @@ def validate_candidate(raw: object) -> dict:
     frontend = static_review(candidate)
     browser = browser_smoke(candidate)
     responsive = responsive_report(candidate)
-    browser_hard = all(
-        browser["checks"].get(key, False)
-        for key in ("quality", "not_blank", "has_navigation", "has_interaction", "has_mobile_css")
-    )
     errors = list(safety["errors"])
+    if not re.search(r"<body\b[\s>][\s\S]*?</body\s*>", candidate, re.I):
+        errors.append("missing_body")
+    # Keep a very small guard against a blank/error shell, but do not require
+    # a large amount of copy: short landing pages are valid sites too.
+    visible_body = re.search(r"<body\b[^>]*>([\s\S]*?)</body\s*>", candidate, re.I)
+    visible_text = re.sub(r"<script[\s\S]*?</script\s*>|<style[\s\S]*?</style\s*>|<[^>]+>", " ", visible_body.group(1), flags=re.I) if visible_body else ""
+    if len(re.sub(r"\s+", " ", visible_text).strip()) < 40:
+        errors.append("empty_interface")
+
+    warnings = []
     if quality["score"] < 0.75:
-        errors.append(f"quality_score={quality['score']}")
+        warnings.append(f"quality_score={quality['score']}")
     if frontend["score"] < 0.75:
-        errors.append(f"frontend_score={frontend['score']}")
-    if not browser_hard:
-        errors.extend(f"browser:{error}" for error in browser["errors"])
+        warnings.append(f"frontend_score={frontend['score']}")
+    warnings.extend(f"browser:{error}" for error in browser["errors"] if error not in {"quality", "not_blank"})
     if not responsive["passed"]:
-        errors.extend(f"responsive:{error}" for error in responsive["errors"])
-    accepted = (
-        not errors
-        and not needs_fallback(candidate)
-        and safety["passed"]
-        and quality["score"] >= 0.75
-        and frontend["score"] >= 0.75
-        and browser_hard
-        and responsive["passed"]
-    )
+        warnings.extend(f"responsive:{error}" for error in responsive["errors"])
+    accepted = not errors and safety["passed"]
     return {
         "accepted": accepted,
         "candidate": candidate,
         "errors": errors,
+        "warnings": warnings,
         "safety": safety,
         "quality": quality,
         "frontend": frontend,

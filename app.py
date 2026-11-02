@@ -312,8 +312,8 @@ def generation_error_text(exc: Exception) -> str:
             return "AI-сервис временно перегружен. Попробуйте ещё раз через пару минут."
     if isinstance(exc, (httpx.ConnectError, httpx.RemoteProtocolError)):
         return "Не удалось связаться с AI-сервисом. Проверьте попытку чуть позже."
-    if "quality" in str(exc).casefold() or "html" in str(exc).casefold():
-        return "AI не собрал страницу, прошедшую проверку. Попробуйте описать сайт проще: кто вы, что показать и как связаться."
+    if "quality" in str(exc).casefold() or "html" in str(exc).casefold() or "validation" in str(exc).casefold():
+        return "Не удалось подготовить безопасный файл сайта. Ваше описание сохранено — попробуйте ещё раз чуть позже."
     if "responsive" in str(exc).casefold() or "mobile" in str(exc).casefold():
         return "AI собрал страницу без надёжной мобильной адаптации. Повторите попытку — мы автоматически проверяем ширину телефона перед публикацией."
     return "Не получилось завершить генерацию. Ваши данные сохранены — попробуйте ещё раз или обратитесь в поддержку."
@@ -678,11 +678,11 @@ async def generate_site(
                 candidate = validation["candidate"]
                 validation_errors = validation["errors"]
                 logger.info(
-                    "generation attempt=%s accepted=%s validation_errors=%s responsive=%s",
+                    "generation attempt=%s accepted=%s validation_errors=%s warnings=%s",
                     attempt + 1,
                     validation["accepted"],
                     ",".join(validation_errors) or "none",
-                    ",".join(validation.get("responsive", {}).get("errors", [])) or "ok",
+                    ",".join(validation.get("warnings", [])) or "none",
                 )
                 if validation["accepted"]:
                     content = candidate
@@ -989,11 +989,11 @@ async def edit_site(message: Message, status: Message, site_id: str, delta: str)
             candidate = validation["candidate"]
             validation_errors = list(validation["errors"])
             logger.info(
-                "edit attempt=%s accepted=%s validation_errors=%s responsive=%s",
+                "edit attempt=%s accepted=%s validation_errors=%s warnings=%s",
                 attempt + 1,
                 validation["accepted"],
                 ",".join(validation_errors) or "none",
-                ",".join(validation.get("responsive", {}).get("errors", [])) or "ok",
+                ",".join(validation.get("warnings", [])) or "none",
             )
             safety_report = validation.get("safety", {"passed": False})
             report = validation.get("quality", {"score": 0})
@@ -1006,10 +1006,6 @@ async def edit_site(message: Message, status: Message, site_id: str, delta: str)
             if re.search(r"телеграм|telegram|@tsuloew|t\.me", request_text) and "https://t.me/tsuloew" not in candidate:
                 requested_feature_errors.append("missing_telegram_link")
             validation_errors.extend(requested_feature_errors)
-            if report["score"] < .75:
-                validation_errors.append(f"quality_score={report['score']}")
-            if frontend_report["score"] < .75:
-                validation_errors.append(f"frontend_score={frontend_report['score']}")
             if not requested_feature_errors and validation["accepted"]:
                 content = candidate
                 break

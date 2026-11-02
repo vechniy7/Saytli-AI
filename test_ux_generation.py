@@ -66,7 +66,7 @@ class UXGenerationTests(unittest.TestCase):
         self.assertTrue(result["accepted"], result["errors"])
         self.assertEqual(result["candidate"].count("<html"), 1)
 
-    def test_mobile_validation_rejects_media_query_without_reflow(self):
+    def test_mobile_validation_reports_weak_css_without_blocking_site(self):
         weak = BASE_HTML.replace(
             '<meta name="viewport" content="width=device-width">',
             '<meta name="viewport" content="width=device-width, initial-scale=1">',
@@ -78,8 +78,8 @@ class UXGenerationTests(unittest.TestCase):
         self.assertFalse(report["passed"])
         self.assertIn("mobile_layout_reflow", report["errors"])
         result = validate_candidate(weak)
-        self.assertFalse(result["accepted"])
-        self.assertTrue(any(error.startswith("responsive:") for error in result["errors"]))
+        self.assertTrue(result["accepted"], result["errors"])
+        self.assertTrue(any(error.startswith("responsive:") for error in result["warnings"]))
 
     def test_responsive_validation_accepts_common_css_formatting_variants(self):
         document = """<!doctype html><html><head>
@@ -142,6 +142,24 @@ class UXGenerationTests(unittest.TestCase):
         self.assertNotIn("width:1200px", repaired.replace(" ", "").lower())
         result = validate_candidate(broken)
         self.assertTrue(result["accepted"], result["errors"])
+
+    def test_quality_warnings_do_not_block_a_short_real_page(self):
+        short_page = """<!doctype html><html><head><title>TsuloIT</title>
+        <meta name="viewport" content="width=device-width"></head><body>
+        <header><h1>TsuloIT</h1></header><main><p>Создание Telegram-ботов на заказ. Свяжитесь с нами.</p></main>
+        </body></html>"""
+        result = validate_candidate(short_page)
+        self.assertTrue(result["accepted"], result["errors"])
+        self.assertTrue(result["warnings"])
+
+    def test_validation_still_rejects_external_scripts(self):
+        unsafe = BASE_HTML.replace(
+            "</body>",
+            '<script src="https://evil.example/widget.js"></script></body>',
+        )
+        result = validate_candidate(unsafe)
+        self.assertFalse(result["accepted"])
+        self.assertIn("no_external_script_tags", result["errors"])
 
     def test_invalid_first_candidate_is_rejected_with_actionable_reasons(self):
         result = validate_candidate("```html\n<iframe src='https://example.com'></iframe>\n```")
