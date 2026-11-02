@@ -6,6 +6,7 @@ from contact_actions import build_contact_actions_fallback
 from generation_validation import validate_candidate
 from pipeline import static_review
 from quality import publication_safety_report
+from responsive_qa import responsive_report
 from skills import choose_skills
 
 
@@ -33,9 +34,30 @@ class UXGenerationTests(unittest.TestCase):
                 self.assertIn(expected, [skill.name for skill in choose_skills(brief)])
 
     def test_valid_model_candidate_is_accepted(self):
-        result = validate_candidate(BASE_HTML)
+        result = validate_candidate(BASE_HTML.replace(
+            '<meta name="viewport" content="width=device-width">',
+            '<meta name="viewport" content="width=device-width, initial-scale=1">',
+        ).replace(
+            '<style>:focus-visible',
+            '<style>*, *::before, *::after { box-sizing: border-box; } img, video, picture, svg { max-width: 100%; height: auto; } .wrap { max-width: min(100% - 2rem, 72rem); } @media (max-width: 700px) { main { grid-template-columns: 1fr; } } :focus-visible',
+        ))
         self.assertTrue(result["accepted"], result["errors"])
         self.assertEqual(result["candidate"].count("<html"), 1)
+
+    def test_mobile_validation_rejects_media_query_without_reflow(self):
+        weak = BASE_HTML.replace(
+            '<meta name="viewport" content="width=device-width">',
+            '<meta name="viewport" content="width=device-width, initial-scale=1">',
+        ).replace(
+            '<style>:focus-visible',
+            '<style>*, *::before, *::after { box-sizing: border-box; } img, video, picture, svg { max-width: 100%; height: auto; } .wrap { max-width: min(100% - 2rem, 72rem); } :focus-visible',
+        ).replace('@media (max-width: 700px) { body { padding: 1rem; } }', '@media (max-width: 700px) { body { padding: 1rem; } }')
+        report = responsive_report(weak)
+        self.assertFalse(report["passed"])
+        self.assertIn("mobile_layout_reflow", report["errors"])
+        result = validate_candidate(weak)
+        self.assertFalse(result["accepted"])
+        self.assertTrue(any(error.startswith("responsive:") for error in result["errors"]))
 
     def test_invalid_first_candidate_is_rejected_with_actionable_reasons(self):
         result = validate_candidate("```html\n<iframe src='https://example.com'></iframe>\n```")

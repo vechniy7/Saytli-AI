@@ -4,6 +4,7 @@ import re
 from browser_qa import browser_smoke
 from pipeline import static_review
 from quality import ensure_initial_render, needs_fallback, publication_safety_report, quality_report
+from responsive_qa import responsive_report
 
 
 def validate_candidate(raw: object) -> dict:
@@ -20,6 +21,7 @@ def validate_candidate(raw: object) -> dict:
     quality = quality_report(candidate)
     frontend = static_review(candidate)
     browser = browser_smoke(candidate)
+    responsive = responsive_report(candidate)
     browser_hard = all(
         browser["checks"].get(key, False)
         for key in ("quality", "not_blank", "has_navigation", "has_interaction", "has_mobile_css")
@@ -31,6 +33,8 @@ def validate_candidate(raw: object) -> dict:
         errors.append(f"frontend_score={frontend['score']}")
     if not browser_hard:
         errors.extend(f"browser:{error}" for error in browser["errors"])
+    if not responsive["passed"]:
+        errors.extend(f"responsive:{error}" for error in responsive["errors"])
     accepted = (
         not errors
         and not needs_fallback(candidate)
@@ -38,6 +42,7 @@ def validate_candidate(raw: object) -> dict:
         and quality["score"] >= 0.75
         and frontend["score"] >= 0.75
         and browser_hard
+        and responsive["passed"]
     )
     return {
         "accepted": accepted,
@@ -47,4 +52,5 @@ def validate_candidate(raw: object) -> dict:
         "quality": quality,
         "frontend": frontend,
         "browser": browser,
+        "responsive": responsive,
     }

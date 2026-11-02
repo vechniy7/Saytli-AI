@@ -291,6 +291,8 @@ def generation_error_text(exc: Exception) -> str:
         return "Не удалось связаться с AI-сервисом. Проверьте попытку чуть позже."
     if "quality" in str(exc).casefold() or "html" in str(exc).casefold():
         return "AI не собрал страницу, прошедшую проверку. Попробуйте описать сайт проще: кто вы, что показать и как связаться."
+    if "responsive" in str(exc).casefold() or "mobile" in str(exc).casefold():
+        return "AI собрал страницу без надёжной мобильной адаптации. Повторите попытку — мы автоматически проверяем ширину телефона перед публикацией."
     return "Не получилось завершить генерацию. Ваши данные сохранены — попробуйте ещё раз или обратитесь в поддержку."
 
 
@@ -650,7 +652,7 @@ async def generate_site(message: Message, status: Message, brief: str):
                     if attempt < 2:
                         request_payload["messages"][1]["content"] = (
                             prompt + "\n\nПредыдущий вариант не прошёл проверки: " + ", ".join(validation_errors)
-                            + ". Исправь конкретно эти причины и верни полный HTML-документ. Не используй iframe/object/embed, внешние script-теги или сетевые запросы из JavaScript."
+                            + ". Исправь конкретно эти причины и верни полный HTML-документ. Особенно проверь ширину 320px: grid/flex должны перестраиваться, изображения не должны выходить за экран, меню и кнопки должны быть доступны пальцем. Не используй iframe/object/embed, внешние script-теги или сетевые запросы из JavaScript."
                         )
             except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as exc:
                 last_error = exc
@@ -898,6 +900,7 @@ async def edit_site(message: Message, status: Message, site_id: str, delta: str)
             f"Сохрани все рабочие функции, контент и ссылки, добавь изменение цельно, не удаляй рабочие разделы. "
             f"Не добавляй магазины, корзины, оплату, авторизацию, каталог товаров или выдуманные факты. "
             f"Удали любые служебные баннеры и подписи о режиме работы из видимого интерфейса. Верни только полный HTML.\n\n"
+            f"МОБИЛЬНАЯ АДАПТАЦИЯ ОБЯЗАТЕЛЬНА: сохрани и улучши mobile-first верстку для ширины 320–390px. Проверь viewport, box-sizing, отсутствие горизонтального overflow, перенос сеток в одну колонку, размеры кнопок от 44px, читаемый текст от 16px и доступное мобильное меню. Не принимай решение только добавлением body padding; в @media (max-width: 700px) реально меняй grid/flex, навигацию и отступы. Не используй основную раскладку на фиксированных ширинах, min-width или абсолютном позиционировании.\n\n"
             f"ПРАВИЛА ДЛЯ КАРТ И КОНТАКТОВ: если пользователь просит карту или маршрут, не используй iframe, object, embed, внешние script-теги, fetch, XMLHttpRequest или WebSocket. "
             f"Сделай аккуратный блок адреса с обычной HTML-кнопкой/ссылкой на https://yandex.ru/maps/ для построения маршрута. "
             f"Если адрес уже есть в текущем HTML — используй его; если адрес не указан, добавь поле ввода адреса и frontend-кнопку, которая открывает ссылку Яндекс.Карт с URL-кодированным адресом. "
@@ -928,15 +931,15 @@ async def edit_site(message: Message, status: Message, site_id: str, delta: str)
                     json=request_payload
                 )
                 response.raise_for_status()
-                candidate = response.json()["choices"][0]["message"]["content"]
+                candidate = response.json()["choices"][0]["message"].get("content")
 
-            candidate = re.sub(r"^```(?:html)?\s*|\s*```$", "", candidate.strip(), flags=re.I)
-            candidate = ensure_initial_render(candidate)
-            safety_report = publication_safety_report(candidate)
-            report = quality_report(candidate)
-            frontend_report = static_review(candidate)
-            browser_report = browser_smoke(candidate)
-            validation_errors = list(safety_report["errors"])
+            validation = validate_candidate(candidate)
+            candidate = validation["candidate"]
+            validation_errors = list(validation["errors"])
+            safety_report = validation.get("safety", {"passed": False})
+            report = validation.get("quality", {"score": 0})
+            frontend_report = validation.get("frontend", {"score": 0})
+            browser_report = validation.get("browser", {"passed": False})
             requested_feature_errors = []
             request_text = delta.casefold()
             if re.search(r"карта|маршрут|яндекс\s*карт|yandex\s*map|maps", request_text) and not re.search(r"yandex\.ru/maps", candidate, re.I):
@@ -948,9 +951,7 @@ async def edit_site(message: Message, status: Message, site_id: str, delta: str)
                 validation_errors.append(f"quality_score={report['score']}")
             if frontend_report["score"] < .75:
                 validation_errors.append(f"frontend_score={frontend_report['score']}")
-            if not browser_report["passed"]:
-                validation_errors.extend(f"browser:{error}" for error in browser_report["errors"])
-            if not requested_feature_errors and not needs_fallback(candidate) and safety_report["passed"] and report["score"] >= .75 and frontend_report["score"] >= .75 and browser_report["passed"]:
+            if not requested_feature_errors and validation["accepted"]:
                 content = candidate
                 break
 
