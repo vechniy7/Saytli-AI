@@ -86,6 +86,18 @@ def unique_site_slug(brief: str, existing_ids) -> str:
     return f"{base}-{index}"
 
 
+def unique_requested_slug(requested: str, existing_ids) -> str:
+    """Normalize a user-chosen URL word and add a numeric collision suffix."""
+    base = transliterate(requested)[:32].strip("-") or "site"
+    existing = set(existing_ids or ())
+    if base not in existing:
+        return base
+    index = 2
+    while f"{base}-{index}" in existing:
+        index += 1
+    return f"{base}-{index}"
+
+
 def set_document_title(document: str, title: str) -> str:
     """Make browser/tab title agree with the recognizable site name."""
     safe_title = escape(title, quote=False)

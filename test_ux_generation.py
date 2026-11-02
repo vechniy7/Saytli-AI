@@ -7,7 +7,7 @@ from generation_validation import validate_candidate
 from pipeline import static_review
 from quality import publication_safety_report
 from responsive_qa import responsive_report
-from site_naming import extract_brand_name, set_document_title, site_title, unique_site_slug
+from site_naming import extract_brand_name, set_document_title, site_title, unique_requested_slug, unique_site_slug
 from llm_stream import stream_content_piece
 from skills import choose_skills
 
@@ -41,6 +41,11 @@ class UXGenerationTests(unittest.TestCase):
         self.assertEqual(site_title(brief), "CuloStore")
         self.assertEqual(unique_site_slug(brief, []), "culostore")
         self.assertEqual(unique_site_slug(brief, ["culostore"]), "culostore-2")
+
+    def test_requested_slug_is_transliterated_and_collision_safe(self):
+        self.assertEqual(unique_requested_slug("Дом Света", []), "dom-sveta")
+        self.assertEqual(unique_requested_slug("TsuloIT", ["tsuloit"]), "tsuloit-2")
+        self.assertEqual(unique_requested_slug("brand", ["brand", "brand-2"]), "brand-3")
 
     def test_russian_brand_and_fallback_titles_are_readable(self):
         self.assertEqual(site_title("Компания называется «Дом Света», сделай сайт услуг."), "Дом Света")
