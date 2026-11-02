@@ -4,7 +4,7 @@ import unittest
 from browser_qa import browser_smoke
 from contact_actions import build_contact_actions_fallback
 from generation_validation import validate_candidate
-from generation_repair import repair_candidate
+from generation_repair import build_safe_fallback_site, repair_candidate
 from pipeline import static_review
 from quality import publication_safety_report
 from responsive_qa import responsive_report
@@ -160,6 +160,15 @@ class UXGenerationTests(unittest.TestCase):
         result = validate_candidate(unsafe)
         self.assertFalse(result["accepted"])
         self.assertIn("no_external_script_tags", result["errors"])
+
+    def test_safe_fallback_is_complete_and_publishable(self):
+        fallback = build_safe_fallback_site(
+            "Дом Света",
+            "Компания по освещению интерьеров. Показываем решения и помогаем выбрать свет.",
+        )
+        result = validate_candidate(fallback)
+        self.assertTrue(result["accepted"], result["errors"])
+        self.assertIn("Дом Света", fallback)
 
     def test_invalid_first_candidate_is_rejected_with_actionable_reasons(self):
         result = validate_candidate("```html\n<iframe src='https://example.com'></iframe>\n```")

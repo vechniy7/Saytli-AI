@@ -37,6 +37,7 @@ from pipeline import static_review
 from design_systems import select_design_system
 from browser_qa import browser_smoke
 from generation_validation import validate_candidate
+from generation_repair import build_safe_fallback_site
 from contact_actions import build_contact_actions_fallback as build_safe_contact_actions_fallback
 from site_naming import set_document_title, site_title, transliterate, unique_requested_slug, unique_site_slug
 from llm_stream import stream_content_piece
@@ -714,7 +715,22 @@ async def generate_site(
         if content is None and last_error:
             raise last_error or RuntimeError("LLM did not return content")
         if content is None:
-            raise RuntimeError("Generated content failed validation: " + ", ".join(validation_errors))
+            # The model can occasionally return an interrupted or empty
+            # response. Publish a safe, complete page instead of turning that
+            # transient model failure into a user-facing generation error.
+            fallback = build_safe_fallback_site(site_name, brief)
+            fallback_validation = validate_candidate(fallback)
+            if not fallback_validation["accepted"]:
+                raise RuntimeError("Generated content failed validation: " + ", ".join(fallback_validation["errors"]))
+            content = fallback_validation["candidate"]
+            safety_report = fallback_validation["safety"]
+            report = fallback_validation["quality"]
+            frontend_report = fallback_validation["frontend"]
+            browser_report = fallback_validation["browser"]
+            logger.warning(
+                "model response unusable; published safe fallback errors=%s",
+                ",".join(validation_errors) or "unknown",
+            )
 
         content = set_document_title(content, site_name)
         await progress(status, stages, 3)
