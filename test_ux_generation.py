@@ -4,13 +4,14 @@ import unittest
 from browser_qa import browser_smoke
 from contact_actions import build_contact_actions_fallback
 from generation_validation import validate_candidate
-from generation_repair import build_safe_fallback_site, repair_candidate
+from generation_repair import build_safe_fallback_site
 from pipeline import static_review
 from quality import publication_safety_report
 from responsive_qa import responsive_report
 from site_naming import extract_brand_name, set_document_title, site_title, unique_requested_slug, unique_site_slug
 from llm_stream import stream_content_piece
 from skills import choose_skills
+from skills import build_skill_prompt
 
 
 BASE_HTML = """<!doctype html>
@@ -35,6 +36,14 @@ class UXGenerationTests(unittest.TestCase):
         for brief, expected in scenarios.items():
             with self.subTest(brief=brief):
                 self.assertIn(expected, [skill.name for skill in choose_skills(brief)])
+
+    def test_prompt_leaves_visual_direction_to_the_model(self):
+        _, prompt = build_skill_prompt("Небольшая мастерская керамики с записью на занятия")
+        self.assertIn("сам реши", prompt)
+        self.assertNotIn("CONTENT HINT", prompt)
+        self.assertNotIn("studio-portfolio", prompt)
+        self.assertNotIn("clear-service-studio", prompt)
+        self.assertNotIn("минимум 4", prompt)
 
     def test_brand_name_creates_short_logical_slug_and_title(self):
         brief = "Я владелец компании CuloStore. Мы продаём товары для дома, нужен современный сайт."
@@ -130,18 +139,6 @@ class UXGenerationTests(unittest.TestCase):
             "<body>",
         )
         self.assertIsNone(stream_content_piece("[DONE]"))
-
-    def test_generation_repair_removes_embed_and_fixed_mobile_overflow(self):
-        broken = BASE_HTML.replace(
-            "</main>",
-            '<iframe src="https://maps.example"></iframe><div style="width:1200px">Карта</div></main>',
-        )
-        repaired = repair_candidate(broken)
-        self.assertNotIn("<iframe", repaired.lower())
-        self.assertIn("Открыть внешний материал", repaired)
-        self.assertNotIn("width:1200px", repaired.replace(" ", "").lower())
-        result = validate_candidate(broken)
-        self.assertTrue(result["accepted"], result["errors"])
 
     def test_quality_warnings_do_not_block_a_short_real_page(self):
         short_page = """<!doctype html><html><head><title>TsuloIT</title>

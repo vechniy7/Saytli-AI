@@ -34,12 +34,11 @@ from dotenv import load_dotenv
 from skills import build_skill_prompt
 from quality import ensure_initial_render, quality_report, needs_fallback, publication_safety_report
 from pipeline import static_review
-from design_systems import select_design_system
 from browser_qa import browser_smoke
 from generation_validation import validate_candidate
 from generation_repair import build_safe_fallback_site
 from contact_actions import build_contact_actions_fallback as build_safe_contact_actions_fallback
-from site_naming import set_document_title, site_title, transliterate, unique_requested_slug, unique_site_slug
+from site_naming import site_title, transliterate, unique_requested_slug, unique_site_slug
 from llm_stream import stream_content_piece
 
 load_dotenv()
@@ -635,7 +634,7 @@ async def generate_site(
 ):
     stages = [
         "Анализ задачи и подбор структуры",
-        "Выбор дизайн-системы и палитры",
+        "Самостоятельная арт-дирекция AI",
         "Генерация адаптивного кода и контента",
         "Проверка верстки, скриптов и безопасности",
         "Публикация и запуск страницы",
@@ -644,12 +643,13 @@ async def generate_site(
         await progress(status, stages, 0)
         site_name = site_title(brief)
         skill_names, prompt = build_skill_prompt(brief)
-        design = select_design_system(skill_names)
+        design = {"id": "ai-directed"}
+        creative_seed = secrets.token_hex(8)
         await progress(status, stages, 1)
         prompt += (
-            f"\n\nART DIRECTION SYSTEM (must follow): {json.dumps(design, ensure_ascii=False)}\n"
+            f"\n\nУНИКАЛЬНЫЙ ЗАПУСК: {creative_seed}. Используй это как внутренний seed для самостоятельного выбора непохожей арт-дирекции; не показывай seed пользователю и не копируй композиции из предыдущих сайтов.\n"
             f"НАЗВАНИЕ САЙТА: используй название «{site_name}» как основной бренд в title, hero и навигации. Не заменяй его случайной фразой из брифа и не добавляй слово 'сайт' к названию бренда без необходимости.\n"
-            "Выбери визуальную систему осознанно и не смешивай её с generic SaaS шаблонами.\n\n"
+            "Сам выбери визуальную систему по смыслу брифа. Не используй заранее заданный шаблон и не повторяй типовой набор hero/cards/pills.\n\n"
             "ПУБЛИКАЦИЯ: не добавляй поверх сайта баннеры или надписи 'ДЕМО-РЕЖИМ', 'Demo mode', 'Local demo mode', 'no real payment'. "
             "Интерфейс должен выглядеть как законченный продукт. Не выдумывай факт реального backend: "
             "интерактивные функции реализуй в рамках frontend, а неподключённые операции оформляй нейтральными рабочими формами."
@@ -661,10 +661,10 @@ async def generate_site(
         request_payload = {
             "model": MODEL,
             "messages": [
-                {"role": "system", "content": "Ты профессиональный frontend-разработчик. Верни только HTML."},
+                {"role": "system", "content": "Ты самостоятельный арт-директор, product designer и senior frontend-разработчик. Сам спроектируй уникальный интерфейс под бриф, не используй шаблонные композиции и верни только полный HTML-документ."},
                 {"role": "user", "content": prompt}
             ],
-            "temperature": 0.7,
+            "temperature": 0.85,
             "max_tokens": GENERATION_MAX_TOKENS
         }
         content = None
@@ -732,7 +732,6 @@ async def generate_site(
                 ",".join(validation_errors) or "unknown",
             )
 
-        content = set_document_title(content, site_name)
         await progress(status, stages, 3)
 
         logger.info(
