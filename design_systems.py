@@ -9,5 +9,5 @@ SYSTEMS = {
 def select_design_system(skill_names):
     if 'services' in skill_names or 'business' in skill_names: return SYSTEMS['services']
     if 'project' in skill_names: return SYSTEMS['project']
-    if 'portfolio' in skill_names: return SYSTEMS['portfolio']
+    if 'portfolio' in skill_names or 'case-study' in skill_names: return SYSTEMS['portfolio']
     return SYSTEMS['generic']

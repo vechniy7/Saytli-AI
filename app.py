@@ -36,6 +36,8 @@ from quality import ensure_initial_render, quality_report, needs_fallback, publi
 from pipeline import static_review
 from design_systems import select_design_system
 from browser_qa import browser_smoke
+from generation_validation import validate_candidate
+from contact_actions import build_contact_actions_fallback as build_safe_contact_actions_fallback
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -52,6 +54,39 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 SITES_DIR.mkdir(parents=True, exist_ok=True)
 _db_lock = threading.Lock()
 DB_LOCK_FILE = DATA_DIR / "sites.json.lock"
+_active_tasks: dict[int, asyncio.Task] = {}
+
+
+def _remember_task(user_id: int, task: asyncio.Task) -> None:
+    """Keep long-running bot work cancellable from the inline cancel button."""
+    _active_tasks[user_id] = task
+
+    def clear_task(done: asyncio.Task) -> None:
+        if _active_tasks.get(user_id) is done:
+            _active_tasks.pop(user_id, None)
+        if done.cancelled():
+            return
+        try:
+            done.exception()
+        except Exception:
+            logger.exception("background bot task failed")
+
+    task.add_done_callback(clear_task)
+
+
+def _start_background_task(user_id: int, coroutine) -> asyncio.Task:
+    previous = _active_tasks.get(user_id)
+    if previous and not previous.done():
+        previous.cancel()
+    task = asyncio.create_task(coroutine)
+    _remember_task(user_id, task)
+    return task
+
+
+async def _cancel_background_task(user_id: int) -> None:
+    task = _active_tasks.pop(user_id, None)
+    if task and not task.done():
+        task.cancel()
 
 
 @contextmanager
@@ -198,14 +233,12 @@ def edit_keyboard(site_id: str) -> InlineKeyboardMarkup:
 
 def main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✨ Создать сайт", callback_data="create"),
-            InlineKeyboardButton(text="💬 AI-консультант", callback_data="chat"),
-        ],
+        [InlineKeyboardButton(text="✨ Создать сайт", callback_data="create")],
         [
             InlineKeyboardButton(text="📁 Мои сайты", callback_data="list"),
-            InlineKeyboardButton(text="ℹ️ Помощь", callback_data="help"),
+            InlineKeyboardButton(text="💬 Помощь AI", callback_data="chat"),
         ],
+        [InlineKeyboardButton(text="ℹ️ Как это работает", callback_data="help")],
     ])
 
 
@@ -217,7 +250,10 @@ def presets_keyboard() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="🚀 Собственный проект", callback_data="preset:project"),
-            InlineKeyboardButton(text="✍️ Свой бриф", callback_data="preset:custom"),
+            InlineKeyboardButton(text="📚 Кейсы и работы", callback_data="preset:case-study"),
+        ],
+        [
+            InlineKeyboardButton(text="✍️ Свой вариант", callback_data="preset:custom"),
         ],
         [
             InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action"),
@@ -225,10 +261,44 @@ def presets_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def input_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_action")],
+    ])
+
+
+def chat_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✨ Создать сайт", callback_data="create")],
+        [InlineKeyboardButton(text="📁 Мои сайты", callback_data="list")],
+        [InlineKeyboardButton(text="❌ Выйти из чата", callback_data="cancel_action")],
+    ])
+
+
+def generation_error_text(exc: Exception) -> str:
+    """Turn common generation failures into useful, non-technical guidance."""
+    if isinstance(exc, httpx.TimeoutException):
+        return "AI долго не отвечает. Ваш сайт не изменён — попробуйте ещё раз чуть позже."
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status in (401, 403):
+            return "Сервис генерации временно недоступен. Мы уже получили технический сигнал; попробуйте позже."
+        if status == 429:
+            return "Сейчас много запросов. Подождите минуту и запустите генерацию ещё раз."
+        if status >= 500:
+            return "AI-сервис временно перегружен. Попробуйте ещё раз через пару минут."
+    if isinstance(exc, (httpx.ConnectError, httpx.RemoteProtocolError)):
+        return "Не удалось связаться с AI-сервисом. Проверьте попытку чуть позже."
+    if "quality" in str(exc).casefold() or "html" in str(exc).casefold():
+        return "AI не собрал страницу, прошедшую проверку. Попробуйте описать сайт проще: кто вы, что показать и как связаться."
+    return "Не получилось завершить генерацию. Ваши данные сохранены — попробуйте ещё раз или обратитесь в поддержку."
+
+
 PRESET_BRIEFS = {
     "portfolio": "Современное личное портфолио специалиста. Покажи кто я, чем занимаюсь, мои ключевые навыки, избранные проекты, процесс работы и способы связи. Используй только факты, которые я укажу, без выдуманных отзывов и цифр.",
     "services": "Понятная страница услуг специалиста. Покажи кому я помогаю, какие задачи решаю, список услуг, этапы работы, примеры работ и простой способ связаться со мной. Не добавляй цены или гарантии, если я их не указал.",
     "project": "Сайт собственного цифрового проекта или сервиса. Объясни проблему, решение, ключевые возможности, сценарий использования, ограничения и способ связи или знакомства с проектом. Не выдумывай пользователей, метрики и интеграции.",
+    "case-study": "Витрина клиентских кейсов и выполненных работ. Для каждого кейса покажи задачу, ход работы и результат только на основе информации пользователя. Не выдумывай клиентов, цифры, логотипы и отзывы.",
 }
 
 
@@ -243,11 +313,12 @@ router = Router()
 
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext):
+    await _cancel_background_task(message.from_user.id)
     await state.clear()
     welcome_text = (
         "🚀 <b>Добро пожаловать в Saytli AI!</b>\n\n"
-        "Я создаю и сразу публикую современные сайты-портфолио с помощью нейросетей.\n\n"
-        "• <b>✨ Создать сайт</b> — портфолио, услуги или собственный проект\n"
+        "Создам и опубликую адаптивный сайт по вашему описанию. Не нужно знать код — просто расскажите, что показать.\n\n"
+        "• <b>✨ Создать сайт</b> — выберите пример или опишите идею своими словами\n"
         "• <b>📁 Мои сайты</b> — просмотр, редактирование и откат версий\n"
         "• <b>💬 AI-консультант</b> — помощь со структурой и текстами\n"
         "• <b>📱 Mini App</b> — открывайте сайты прямо внутри Telegram!"
@@ -258,6 +329,7 @@ async def start(message: Message, state: FSMContext):
 @router.callback_query(F.data == "main_menu")
 async def main_menu_callback(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
+    await _cancel_background_task(callback.from_user.id)
     await state.clear()
     welcome_text = (
         "🏠 <b>Главное меню Saytli AI</b>\n\n"
@@ -269,6 +341,8 @@ async def main_menu_callback(callback: CallbackQuery, state: FSMContext):
 @router.message(Command("create", "new"))
 @router.callback_query(F.data == "create")
 async def create_start(event: Message | CallbackQuery, state: FSMContext):
+    user_id = event.from_user.id
+    await _cancel_background_task(user_id)
     if isinstance(event, CallbackQuery):
         await event.answer()
         msg = event.message
@@ -278,9 +352,10 @@ async def create_start(event: Message | CallbackQuery, state: FSMContext):
     await state.set_state(CreateSite.brief)
     prompt_text = (
         "✨ <b>Создание нового сайта</b>\n\n"
-        "Выберите направление или <b>напишите свой бриф сообщением</b>. Saytli создаёт личные портфолио, страницы услуг и сайты собственных проектов.\n\n"
-        "<i>Пример: «Я дизайнер интерфейсов. Покажи мои услуги, 3 проекта, процесс работы и контакты»</i>\n\n"
-        "/cancel — отмена в любой момент"
+        "Сначала выберите тип сайта или нажмите «Свой вариант». Затем одним сообщением напишите:\n"
+        "1) кто вы или чем занимаетесь; 2) что показать; 3) как с вами связаться.\n\n"
+        "<i>Пример: «Я мастер по ремонту велосипедов в Казани. Покажи услуги, адрес и телефон. Стиль — светлый и современный»</i>\n\n"
+        "Можно написать обычным текстом, без специальных команд. Отмена: /cancel"
     )
     if isinstance(event, CallbackQuery):
         await msg.edit_text(prompt_text, reply_markup=presets_keyboard(), parse_mode="HTML")
@@ -296,12 +371,14 @@ async def preset_chosen(callback: CallbackQuery, state: FSMContext):
         await state.set_state(CreateSite.brief)
         await callback.message.edit_text(
             "✍️ <b>Опишите будущий сайт</b>\n\n"
-            "Расскажите, кто вы, чем занимаетесь, какие проекты или услуги показать и как с вами связаться. Можно писать свободно — AI соберёт из этого структуру сайта.",
+            "Напишите одним сообщением: кто вы/ваш проект, для кого сайт, какие разделы нужны, контакты и желаемый стиль. Если чего-то пока нет — пропустите. Можно своими словами.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]]),
             parse_mode="HTML",
         )
         return
     brief = PRESET_BRIEFS.get(preset_key)
     if not brief:
+        await callback.answer("Не нашёл этот вариант", show_alert=True)
         await callback.message.answer("Шаблон не найден. Опишите сайт своими словами.")
         return
 
@@ -309,6 +386,7 @@ async def preset_chosen(callback: CallbackQuery, state: FSMContext):
     try:
         status = await callback.message.edit_text(
             "⏳ <b>Инициализация генерации...</b>\nШаблон выбран, запускаю разработку.",
+            reply_markup=input_cancel_keyboard(),
             parse_mode="HTML"
         )
     except Exception:
@@ -316,12 +394,14 @@ async def preset_chosen(callback: CallbackQuery, state: FSMContext):
             "⏳ <b>Инициализация генерации...</b>\nШаблон выбран, запускаю разработку.",
             parse_mode="HTML"
         )
-    asyncio.create_task(generate_site(callback.message, status, brief))
+    _start_background_task(callback.from_user.id, generate_site(callback.message, status, brief))
 
 
 @router.message(Command("cancel"))
 @router.callback_query(F.data == "cancel_action")
 async def cancel(event: Message | CallbackQuery, state: FSMContext):
+    user_id = event.from_user.id
+    await _cancel_background_task(user_id)
     if isinstance(event, CallbackQuery):
         await event.answer("Действие отменено")
         msg = event.message
@@ -339,6 +419,7 @@ async def cancel(event: Message | CallbackQuery, state: FSMContext):
 @router.message(Command("chat"))
 @router.callback_query(F.data == "chat")
 async def chat_start(event: Message | CallbackQuery, state: FSMContext):
+    await _cancel_background_task(event.from_user.id)
     if isinstance(event, CallbackQuery):
         await event.answer()
         msg = event.message
@@ -349,18 +430,20 @@ async def chat_start(event: Message | CallbackQuery, state: FSMContext):
     await state.update_data(chat_site_id=None)
     text = (
         "💬 <b>AI-консультант Saytli</b>\n\n"
-        "Напишите любой вопрос или задачу: помогу составить УТП, структуру страниц, подобрать стиль или цветовую гамму.\n\n"
-        "<i>Для выхода отправьте: /cancel</i>"
+        "Напишите вопрос или задачу — помогу с текстом, структурой, стилем и правками сайта.\n\n"
+        "<i>Примеры: «Какие блоки нужны фотографу?» или «Как лучше показать мои услуги?»</i>\n\n"
+        "Для выхода нажмите кнопку ниже или отправьте /cancel."
     )
     if isinstance(event, CallbackQuery):
-        await msg.edit_text(text, reply_markup=main_keyboard(), parse_mode="HTML")
+        await msg.edit_text(text, reply_markup=chat_keyboard(), parse_mode="HTML")
     else:
-        await msg.answer(text, reply_markup=main_keyboard(), parse_mode="HTML")
+        await msg.answer(text, reply_markup=chat_keyboard(), parse_mode="HTML")
 
 
 @router.message(Command("help"))
 @router.callback_query(F.data == "help")
 async def help_command(event: Message | CallbackQuery):
+    await _cancel_background_task(event.from_user.id)
     if isinstance(event, CallbackQuery):
         await event.answer()
         msg = event.message
@@ -369,15 +452,17 @@ async def help_command(event: Message | CallbackQuery):
 
     text = (
         "ℹ️ <b>Возможности и команды Saytli AI</b>\n\n"
-        "• <b>/create</b> — запуск создания нового сайта по брифу или шаблону.\n"
-        "• <b>/sites</b> — дашборд со всеми вашими проектами.\n"
-        "• <b>/chat</b> — консультация с продуктовым AI-дизайнером.\n"
-        "• <b>/cancel</b> — прервать текущий ввод.\n\n"
+        "<b>Как создать сайт:</b>\n"
+        "1. Нажмите «Создать сайт».\n"
+        "2. Выберите направление или «Свой вариант».\n"
+        "3. Напишите, кто вы, что показать, контакты и желаемый стиль.\n"
+        "4. Подождите результат — ссылка появится в этом чате.\n\n"
+        "<b>Команды:</b> /create — создать · /sites — мои сайты · /chat — спросить AI · /cancel — отмена\n\n"
         "<b>Ключевые фичи:</b>\n"
         "✓ <b>Telegram Mini Apps</b> — мгновенный просмотр сайта прямо в боте.\n"
         "✓ <b>Умные правки через ИИ</b> — доработка конкретных блоков естественным языком.\n"
         "✓ <b>Мгновенный откат</b> — верните предыдущую версию, если правка не подошла.\n"
-        "✓ <b>Три понятных направления</b> — портфолио, услуги и собственный проект.\n"
+        "✓ <b>Понятные направления</b> — портфолио, услуги, проект и кейсы.\n"
         "✓ <b>Дизайн-системы</b> — профессиональная адаптивная верстка без шаблонного вида."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -442,14 +527,18 @@ async def chat_message(message: Message, state: FSMContext):
         context = f"site_id={site_id}; brief={site.get('brief','')}; version={site.get('version',1)}"
     try:
         answer = await ask_ai(message, text, context)
-        await message.answer(f"🤖 <b>Saytli AI</b>\n\n{html.escape(answer)}", parse_mode="HTML", reply_markup=main_keyboard())
+        await message.answer(f"🤖 <b>Saytli AI</b>\n\n{html.escape(answer)}", parse_mode="HTML", reply_markup=chat_keyboard())
     except Exception:
-        await message.answer("Не удалось получить ответ от AI. Попробуйте ещё раз через несколько секунд.", reply_markup=main_keyboard())
+        logger.exception("AI consultant request failed")
+        await message.answer("Не удалось получить ответ сейчас. Ваш вопрос не потерян — отправьте его ещё раз через минуту или вернитесь в главное меню.", reply_markup=chat_keyboard())
 
 
 @router.message(CreateSite.brief)
 async def receive_brief(message: Message, state: FSMContext):
     brief = (message.text or "").strip()
+    if not brief:
+        await message.answer("Отправьте описание сайта текстом. Например: «Я фотограф в Казани, покажи портфолио, услуги и контакты».")
+        return
     if len(brief) < 10:
         await message.answer("Опишите идею чуть подробнее (минимум 10 символов).")
         return
@@ -460,12 +549,13 @@ async def receive_brief(message: Message, state: FSMContext):
     try:
         status = await message.answer(
             "⚡ <b>Запуск генерации сайта</b>\n\nПодключаюсь к дизайн-системе...",
+            reply_markup=input_cancel_keyboard(),
             parse_mode="HTML"
         )
     except Exception:
         logger.warning("could not send generation status")
         return
-    asyncio.create_task(generate_site(message, status, brief))
+    _start_background_task(message.from_user.id, generate_site(message, status, brief))
 
 
 def render_progress_bar(current: int, total: int = 5) -> str:
@@ -494,9 +584,9 @@ async def progress(status: Message, stages: list[str], current: int):
         + "\n".join(lines)
     )
     try:
-        await status.edit_text(text, parse_mode="HTML")
+        await status.edit_text(text, parse_mode="HTML", reply_markup=input_cancel_keyboard())
     except Exception:
-        pass
+        logger.debug("could not update generation progress", exc_info=True)
 
 
 async def generate_site(message: Message, status: Message, brief: str):
@@ -536,7 +626,8 @@ async def generate_site(message: Message, status: Message, brief: str):
         content = None
         last_error = None
         await progress(status, stages, 2)
-        for attempt in range(2):
+        validation_errors = []
+        for attempt in range(3):
             try:
                 async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=20.0)) as client:
                     response = await client.post(
@@ -545,35 +636,48 @@ async def generate_site(message: Message, status: Message, brief: str):
                         json=request_payload
                     )
                     response.raise_for_status()
-                    content = response.json()["choices"][0]["message"]["content"]
-                    break
-            except (httpx.ReadTimeout, httpx.ConnectError, httpx.RemoteProtocolError) as exc:
+                    last_error = None
+                    validation = validate_candidate(response.json()["choices"][0]["message"].get("content"))
+                    candidate = validation["candidate"]
+                    validation_errors = validation["errors"]
+                    if validation["accepted"]:
+                        content = candidate
+                        safety_report = validation["safety"]
+                        report = validation["quality"]
+                        frontend_report = validation["frontend"]
+                        browser_report = validation["browser"]
+                        break
+                    if attempt < 2:
+                        request_payload["messages"][1]["content"] = (
+                            prompt + "\n\nПредыдущий вариант не прошёл проверки: " + ", ".join(validation_errors)
+                            + ". Исправь конкретно эти причины и верни полный HTML-документ. Не используй iframe/object/embed, внешние script-теги или сетевые запросы из JavaScript."
+                        )
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as exc:
                 last_error = exc
-                if attempt == 0:
+                if attempt < 2:
                     request_payload["messages"][1]["content"] = (
                         prompt + "\n\nСделай реализацию как цельный single-page HTML-портфолио с рабочей навигацией и frontend-интерактивностью; не описывай backend-код."
                     )
-        if content is None:
+            except httpx.HTTPStatusError as exc:
+                last_error = exc
+                if exc.response.status_code not in (429, 500, 502, 503, 504) or attempt == 2:
+                    raise
+                await asyncio.sleep(1.5 * (attempt + 1))
+            except (ValueError, KeyError, TypeError) as exc:
+                last_error = exc
+                if attempt < 2:
+                    request_payload["messages"][1]["content"] = prompt + "\n\nПредыдущий ответ оказался некорректным. Верни только полный самодостаточный HTML-документ."
+        if content is None and last_error:
             raise last_error or RuntimeError("LLM did not return content")
+        if content is None:
+            raise RuntimeError("Generated content failed validation: " + ", ".join(validation_errors))
 
-        content = re.sub(r"^```(?:html)?\s*|\s*```$", "", content.strip(), flags=re.I)
-        if not re.search(r"<html[\s>]|<!doctype html", content, re.I):
-            raise RuntimeError("Generated content is not HTML")
-        content = ensure_initial_render(content)
-        safety_report = publication_safety_report(content)
         await progress(status, stages, 3)
 
-        report = quality_report(content)
-        frontend_report = static_review(content)
-        browser_report = browser_smoke(content)
         logger.info(
             "site quality score=%s frontend_score=%s browser=%s",
             report["score"], frontend_report["score"], browser_report["passed"]
         )
-        browser_hard = all(browser_report["checks"].get(k, False) for k in ("quality", "not_blank", "has_navigation", "has_interaction", "has_mobile_css"))
-        if report["score"] < 0.75 or frontend_report["score"] < 0.75 or not browser_hard or needs_fallback(content) or not safety_report["passed"]:
-            raise RuntimeError("Generated site quality score too low or empty")
-
         await progress(status, stages, 4)
         folder = SITES_DIR / site_id
         folder.mkdir(parents=True, exist_ok=False)
@@ -604,14 +708,25 @@ async def generate_site(message: Message, status: Message, brief: str):
             await status.edit_text(result_text, parse_mode="HTML", reply_markup=site_keyboard(site_id))
         except Exception:
             await message.answer(result_text, parse_mode="HTML", reply_markup=site_keyboard(site_id))
+    except asyncio.CancelledError:
+        logger.info("site generation cancelled")
+        return
     except Exception as exc:
         logger.exception("site generation failed: %s", type(exc).__name__)
-        await status.edit_text("Не удалось создать сайт. Попробуйте ещё раз позже или измените бриф.", reply_markup=main_keyboard())
+        try:
+            await status.edit_text(
+                f"⚠️ <b>Не удалось создать сайт</b>\n\n{html.escape(generation_error_text(exc))}\n\nМожете изменить описание и попробовать снова.",
+                parse_mode="HTML",
+                reply_markup=main_keyboard(),
+            )
+        except Exception:
+            logger.warning("could not show generation failure status", exc_info=True)
 
 
 @router.message(Command("sites", "list", "panel"))
 @router.callback_query(F.data == "list")
 async def list_sites(event: Message | CallbackQuery):
+    await _cancel_background_task(event.from_user.id)
     is_callback = isinstance(event, CallbackQuery)
     if is_callback:
         await event.answer()
@@ -735,9 +850,9 @@ async def ai_edit_start(callback: CallbackQuery, state: FSMContext):
         "• <i>«Добавь ещё один кейс в раздел проектов»</i>\n"
         "• <i>«Сделай блок услуг более понятным и компактным»</i>\n"
         "• <i>«Замени контакты и добавь ссылку на Telegram»</i>\n\n"
-        "/cancel — отменить редактирование"
+        "Опишите одну-две правки за раз. Для отмены нажмите кнопку ниже или отправьте /cancel."
     )
-    await callback.message.edit_text(text, parse_mode="HTML")
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=input_cancel_keyboard())
 
 
 @router.message(CreateSite.edit_brief)
@@ -759,67 +874,13 @@ async def receive_edit_brief(message: Message, state: FSMContext):
         status = await message.answer(
             "⏳ <b>Обновляю сайт...</b>\n\n"
             "1. Анализ изменений\n2. Обновление верстки\n3. Проверка качества\n4. Публикация",
+            reply_markup=input_cancel_keyboard(),
             parse_mode="HTML"
         )
     except Exception:
         logger.warning("could not send edit status")
         return
-    asyncio.create_task(edit_site(message, status, site_id, delta))
-
-
-def build_contact_actions_fallback(current: str, delta: str) -> str | None:
-    """Apply safe, deterministic contact changes when the model edit is rejected.
-
-    Map embeds and third-party widgets are intentionally rejected by the
-    publication safety policy.  These common requests do not need an LLM at
-    all: a normal link plus a small local form is more reliable and keeps the
-    generated page inside the static-site contract.
-    """
-    request = delta.casefold()
-    wants_map = bool(re.search(r"карта|маршрут|яндекс\s*карт|yandex\s*map|maps", request))
-    wants_telegram = bool(re.search(r"телеграм|telegram|@tsuloew|t\.me", request))
-    if not wants_map and not wants_telegram:
-        return None
-    if not re.search(r"</body\s*>", current, re.I):
-        return None
-
-    parts = []
-    if wants_map and 'id="saytli-route-actions"' not in current:
-        parts.append(
-            """<section id="saytli-route-actions" aria-label="Маршрут" style="margin:2rem 0;padding:1.25rem;border:1px solid rgba(127,127,127,.25);border-radius:1rem">
-  <h2>Как нас найти</h2>
-  <p>Введите адрес, чтобы построить маршрут от вашего местоположения.</p>
-  <div style="display:flex;gap:.75rem;flex-wrap:wrap;align-items:center">
-    <label for="saytli-route-address" style="position:absolute;width:1px;height:1px;overflow:hidden">Адрес</label>
-    <input id="saytli-route-address" type="text" placeholder="Введите адрес" autocomplete="street-address" style="flex:1 1 16rem;min-height:2.75rem;padding:.65rem .8rem;border:1px solid currentColor;border-radius:.65rem">
-    <button id="saytli-route-button" type="button" style="min-height:2.75rem;padding:.65rem 1rem;border:0;border-radius:.65rem;cursor:pointer">Построить маршрут</button>
-  </div>
-</section>
-<script>
-(function () {
-  var input = document.getElementById("saytli-route-address");
-  var button = document.getElementById("saytli-route-button");
-  if (!input || !button) return;
-  button.addEventListener("click", function () {
-    var address = input.value.trim();
-    if (!address) { input.focus(); return; }
-    window.open("https://yandex.ru/maps/?rtext=~" + encodeURIComponent(address) + "&rtt=auto", "_blank", "noopener");
-  });
-}());
-</script>"""
-        )
-    if wants_telegram and "https://t.me/tsuloew" not in current:
-        parts.append(
-            """<a href="https://t.me/tsuloew" target="_blank" rel="noopener noreferrer" aria-label="Связаться в Telegram" style="display:inline-flex;align-items:center;gap:.5rem">Написать в Telegram</a>"""
-        )
-    if not parts:
-        return current
-
-    # Keep the fallback self-contained and do not interpolate the user's text
-    # into HTML or JavaScript.
-    addition = "\n<div id=\"saytli-contact-actions\" style=\"display:flex;gap:1rem;flex-wrap:wrap;align-items:center;margin:1.5rem 0\">\n" + "\n".join(parts) + "\n</div>\n"
-    marker = re.search(r"</body\s*>", current, re.I)
-    return current[:marker.start()] + addition + current[marker.start():]
+    _start_background_task(message.from_user.id, edit_site(message, status, site_id, delta))
 
 
 async def edit_site(message: Message, status: Message, site_id: str, delta: str):
@@ -907,7 +968,7 @@ async def edit_site(message: Message, status: Message, site_id: str, delta: str)
             # Contact/map requests have a safe local implementation. This
             # prevents a model choosing a forbidden iframe from turning a
             # valid user request into a failed edit.
-            fallback = build_contact_actions_fallback(current, delta)
+            fallback = build_safe_contact_actions_fallback(current, delta)
             if fallback:
                 fallback = ensure_initial_render(fallback)
                 fallback_safety = publication_safety_report(fallback)
@@ -961,14 +1022,20 @@ async def edit_site(message: Message, status: Message, site_id: str, delta: str)
             parse_mode="HTML",
             reply_markup=site_keyboard(site_id)
         )
+    except asyncio.CancelledError:
+        logger.info("site edit cancelled")
+        return
     except Exception as exc:
         logger.exception("site edit failed: %s", type(exc).__name__)
-        await status.edit_text("Не удалось обновить сайт. Предыдущая версия сохранена.", reply_markup=main_keyboard())
-        await message.answer(
-            "🤖 AI-редактор не смог применить изменение. Текущая версия сайта не затронута. "
-            "Попробуйте сформулировать задачу более точечно.",
-            reply_markup=main_keyboard()
-        )
+        try:
+            await status.edit_text(
+                "⚠️ <b>Правка не применена</b>\n\n"
+                "Текущая версия сайта не затронута. Попробуйте описать одно изменение за раз — например: «добавь кнопку Telegram в блок контактов».",
+                parse_mode="HTML",
+                reply_markup=edit_keyboard(site_id),
+            )
+        except Exception:
+            logger.warning("could not show edit failure status", exc_info=True)
 
 
 @router.callback_query(F.data.startswith("rollback:"))

@@ -32,6 +32,7 @@ class ProductionContractTests(unittest.TestCase):
         self.assertEqual(select_design_system(["portfolio"])["id"], "studio-portfolio")
         self.assertEqual(select_design_system(["services"])["id"], "clear-service-studio")
         self.assertEqual(select_design_system(["project"])["id"], "product-story")
+        self.assertEqual(select_design_system(["case-study"])["id"], "studio-portfolio")
 
     def test_safe_html_passes_static_and_browser_checks(self):
         self.assertTrue(publication_safety_report(SAFE_HTML)["passed"])
