@@ -1,4 +1,5 @@
 """Deterministic validation for model-generated static HTML."""
+import html as html_lib
 import re
 
 from browser_qa import browser_smoke
@@ -7,7 +8,24 @@ from quality import publication_safety_report, quality_report
 from responsive_qa import responsive_report
 
 
-def validate_candidate(raw: object) -> dict:
+def _image_warnings(html: str) -> list[str]:
+    warnings: list[str] = []
+    for tag in re.findall(r"<img\b[^>]*>", html, re.I):
+        if not re.search(r"\bloading\s*=", tag, re.I):
+            warnings.append("missing_loading_hint")
+        if not re.search(r"\bwidth\s*=|\baspect-ratio\s*:", tag, re.I):
+            warnings.append("missing_reserved_dimensions")
+        src = re.search(r"\bsrc\s*=\s*['\"]([^'\"]+)", tag, re.I)
+        if src and not re.match(r"https://|/", src.group(1), re.I):
+            warnings.append("non_https_image_source")
+    return sorted(set(warnings))
+
+
+def validate_candidate(
+    raw: object,
+    expected_asset_urls: list[str] | None = None,
+    require_assets: bool = False,
+) -> dict:
     """Normalize one model response.
 
     Publication safety and a non-empty HTML document are hard gates. Visual
@@ -47,6 +65,16 @@ def validate_candidate(raw: object) -> dict:
     warnings.extend(f"browser:{error}" for error in browser["errors"] if error not in {"quality", "not_blank"})
     if not responsive["passed"]:
         warnings.extend(f"responsive:{error}" for error in responsive["errors"])
+    image_count = len(re.findall(r"<img\b", candidate, re.I))
+    images_without_alt = len(re.findall(r"<img\b(?![^>]*\balt\s*=)[^>]*>", candidate, re.I))
+    if images_without_alt:
+        warnings.append(f"images_without_alt={images_without_alt}")
+    if image_count:
+        warnings.extend(f"image:{error}" for error in _image_warnings(candidate))
+    asset_usage = _asset_usage(candidate, expected_asset_urls or [])
+    warnings.extend(f"assets:{error}" for error in asset_usage["warnings"])
+    if require_assets and asset_usage["warnings"]:
+        errors.extend(f"assets:{error}" for error in asset_usage["warnings"])
     accepted = not errors and safety["passed"]
     return {
         "accepted": accepted,
@@ -58,4 +86,19 @@ def validate_candidate(raw: object) -> dict:
         "frontend": frontend,
         "browser": browser,
         "responsive": responsive,
+        "assets": asset_usage,
     }
+
+
+def _asset_usage(html: str, expected_urls: list[str]) -> dict:
+    """Check whether model output preserved the resolver's trusted image URLs."""
+    if not expected_urls:
+        return {"expected": [], "used": [], "warnings": []}
+    image_tags = "\n".join(re.findall(r"<img\b[^>]*>", html, re.I))
+    normalized_tags = html_lib.unescape(image_tags)
+    used = [url for url in expected_urls if url in normalized_tags]
+    sources = re.findall(r"\bsrc\s*=\s*['\"](https://[^'\"]+)", normalized_tags, re.I)
+    warnings = [] if used else ["trusted_asset_not_used"]
+    if any(source not in expected_urls for source in sources):
+        warnings.append("unapproved_external_image")
+    return {"expected": expected_urls, "used": used, "warnings": sorted(set(warnings))}

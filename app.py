@@ -40,6 +40,8 @@ from generation_repair import build_safe_fallback_site
 from contact_actions import build_contact_actions_fallback as build_safe_contact_actions_fallback
 from site_naming import site_title, transliterate, unique_requested_slug, unique_site_slug
 from llm_stream import stream_content_piece
+from visual_assets import assets_prompt, resolve_visual_assets
+from art_direction import art_direction_prompt
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -646,6 +648,16 @@ async def generate_site(
         design = {"id": "ai-directed"}
         creative_seed = secrets.token_hex(8)
         await progress(status, stages, 1)
+        try:
+            assets = await resolve_visual_assets(brief)
+        except Exception as exc:
+            # Asset discovery is an enhancement, never a reason to fail a
+            # complete website generation when a provider is unavailable.
+            assets = []
+            logger.warning("visual asset resolver unavailable: %s", type(exc).__name__)
+        prompt += assets_prompt(assets)
+        logger.info("visual assets resolved=%s sources=%s", len(assets), ",".join(asset.source for asset in assets) or "none")
+        prompt += art_direction_prompt(creative_seed)
         prompt += (
             f"\n\nУНИКАЛЬНЫЙ ЗАПУСК: {creative_seed}. Используй это как внутренний seed для самостоятельного выбора непохожей арт-дирекции; не показывай seed пользователю и не копируй композиции из предыдущих сайтов.\n"
             f"НАЗВАНИЕ САЙТА: используй название «{site_name}» как основной бренд в title, hero и навигации. Не заменяй его случайной фразой из брифа и не добавляй слово 'сайт' к названию бренда без необходимости.\n"
@@ -669,13 +681,15 @@ async def generate_site(
         }
         content = None
         last_error = None
+        expected_asset_urls = [asset.url for asset in assets]
+        require_assets = any(asset.required for asset in assets)
         await progress(status, stages, 2)
         validation_errors = []
         for attempt in range(GENERATION_ATTEMPTS):
             try:
                 candidate = await request_llm(request_payload)
                 last_error = None
-                validation = validate_candidate(candidate)
+                validation = validate_candidate(candidate, expected_asset_urls, require_assets=require_assets)
                 candidate = validation["candidate"]
                 validation_errors = validation["errors"]
                 logger.info(
@@ -719,7 +733,17 @@ async def generate_site(
             # response. Publish a safe, complete page instead of turning that
             # transient model failure into a user-facing generation error.
             fallback = build_safe_fallback_site(site_name, brief)
-            fallback_validation = validate_candidate(fallback)
+            if require_assets:
+                required_asset = next(asset for asset in assets if asset.required)
+                fallback_image = (
+                    f'<figure style="margin:2rem auto;max-width:42rem">'
+                    f'<img src="{html.escape(required_asset.url, quote=True)}" '
+                    f'alt="{html.escape(required_asset.alt, quote=True)}" loading="eager" '
+                    f'width="1200" style="display:block;width:100%;height:auto;aspect-ratio:4/3;object-fit:contain">'
+                    f'<figcaption>{html.escape(required_asset.credit)}</figcaption></figure>'
+                )
+                fallback = fallback.replace("<main>", "<main>\n" + fallback_image, 1)
+            fallback_validation = validate_candidate(fallback, expected_asset_urls, require_assets=require_assets)
             if not fallback_validation["accepted"]:
                 raise RuntimeError("Generated content failed validation: " + ", ".join(fallback_validation["errors"]))
             content = fallback_validation["candidate"]
@@ -742,14 +766,14 @@ async def generate_site(
                     "model": MODEL,
                     "messages": [
                         {"role": "system", "content": REVIEW_SYSTEM},
-                        {"role": "user", "content": f"Описание проекта:\n{brief}\n\nИсходный HTML:\n{content}"},
+                        {"role": "user", "content": f"Описание проекта:\n{brief}\n{assets_prompt(assets)}\n\nИсходный HTML:\n{content}"},
                     ],
                     "temperature": 0.3,
                     "max_tokens": max(GENERATION_MAX_TOKENS, 16000),
                 }
                 reviewed_raw = await request_llm(review_payload)
                 reviewed, review_meta = parse_review(reviewed_raw, content)
-                reviewed_validation = validate_candidate(reviewed)
+                reviewed_validation = validate_candidate(reviewed, expected_asset_urls, require_assets=require_assets)
                 if reviewed_validation["accepted"]:
                     content = reviewed_validation["candidate"]
                     safety_report = reviewed_validation["safety"]
@@ -803,6 +827,7 @@ async def generate_site(
             "version": 1,
             "versions": [{"version": 1, "path": str(folder), "summary": "Исходная генерация"}],
             "quality": {"static": frontend_report, "browser": browser_report},
+            "visual_assets": [asset.__dict__ for asset in assets],
             "created": __import__("datetime").datetime.utcnow().isoformat(),
             "path": str(folder),
         }

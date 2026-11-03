@@ -14,6 +14,8 @@ from site_naming import extract_brand_name, set_document_title, site_title, uniq
 from llm_stream import stream_content_piece
 from skills import choose_skills
 from skills import build_skill_prompt
+from visual_assets import VisualAsset, assets_prompt
+from art_direction import DIRECTIONS, art_direction_prompt, choose_art_direction
 
 
 BASE_HTML = """<!doctype html>
@@ -46,6 +48,32 @@ class UXGenerationTests(unittest.TestCase):
         self.assertNotIn("studio-portfolio", prompt)
         self.assertNotIn("clear-service-studio", prompt)
         self.assertNotIn("минимум 4", prompt)
+
+    def test_prompt_sets_2026_art_direction_and_real_asset_contract(self):
+        _, prompt = build_skill_prompt("Лендинг для нового iPhone")
+        self.assertIn("ПЛАНКА СОВРЕМЕННОГО САЙТА 2026", prompt)
+        self.assertIn("не подделывай реалистичные товары", prompt)
+        self.assertIn("signature-момент", prompt)
+
+    def test_asset_prompt_freezes_real_urls_and_has_safe_fallback(self):
+        asset = VisualAsset(
+            "https://www.apple.com/v/iphone-17/k/images/overview/contrast/iphone_17__di090vk53j6u_large_2x.jpg",
+            "Официальная фотография продукта Apple",
+            "Apple",
+            "Изображение: Apple",
+            required=True,
+        )
+        prompt = assets_prompt([asset])
+        self.assertIn(asset.url, prompt)
+        self.assertIn("Не создавай рядом CSS/SVG-аналог", prompt)
+        self.assertIn("проверенного предметного фото не найдено", assets_prompt([]))
+
+    def test_art_direction_is_deterministic_but_has_multiple_lenses(self):
+        self.assertEqual(choose_art_direction("seed-a"), choose_art_direction("seed-a"))
+        self.assertGreaterEqual(len(DIRECTIONS), 6)
+        prompt = art_direction_prompt("seed-a")
+        self.assertIn("ВЫБРАННАЯ АРТ-ДИРЕКЦИОННАЯ ШКОЛА", prompt)
+        self.assertIn("не копируй шаблон", prompt)
 
     def test_brand_name_creates_short_logical_slug_and_title(self):
         brief = "Я владелец компании CuloStore. Мы продаём товары для дома, нужен современный сайт."
@@ -159,6 +187,30 @@ class UXGenerationTests(unittest.TestCase):
         result = validate_candidate(unsafe)
         self.assertFalse(result["accepted"])
         self.assertIn("no_external_script_tags", result["errors"])
+
+    def test_image_quality_is_reported_without_blocking_safe_markup(self):
+        document = BASE_HTML.replace("</main>", '<img src="https://www.apple.com/product.jpg"><img alt="ok" src="https://www.apple.com/other.jpg" loading="lazy" width="800"></main>')
+        result = validate_candidate(document)
+        self.assertTrue(result["accepted"], result["errors"])
+        self.assertIn("images_without_alt=1", result["warnings"])
+        self.assertIn("image:missing_loading_hint", result["warnings"])
+
+    def test_trusted_asset_usage_is_reported(self):
+        trusted = "https://www.apple.com/product.jpg"
+        result = validate_candidate(BASE_HTML + f'<img src="{trusted}" alt="product">', [trusted])
+        self.assertEqual(result["assets"]["used"], [trusted])
+        missing = validate_candidate(BASE_HTML, [trusted])
+        self.assertIn("assets:trusted_asset_not_used", missing["warnings"])
+        required = validate_candidate(BASE_HTML, [trusted], require_assets=True)
+        self.assertFalse(required["accepted"])
+        self.assertIn("assets:trusted_asset_not_used", required["errors"])
+
+    def test_unapproved_external_images_are_reported(self):
+        result = validate_candidate(
+            BASE_HTML + '<img src="https://random.example/image.jpg" alt="photo">',
+            ["https://www.apple.com/product.jpg"],
+        )
+        self.assertIn("assets:unapproved_external_image", result["warnings"])
 
     def test_safe_fallback_is_complete_and_publishable(self):
         fallback = build_safe_fallback_site(
